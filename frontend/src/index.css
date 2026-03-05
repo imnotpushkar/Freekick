@@ -1,0 +1,43 @@
+/* Google Fonts — loaded before Tailwind so font-family works immediately */
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+/* Tailwind's three core directives:
+   @tailwind base     — normalizes browser default styles (like a CSS reset)
+   @tailwind components — layer for reusable component classes (we don't use many)
+   @tailwind utilities  — all the utility classes: p-4, text-white, flex, etc.
+   
+   PostCSS processes this file and replaces these directives with
+   actual generated CSS based on what classes appear in your source files. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base styles applied globally.
+   @layer base puts these inside Tailwind's base layer so they
+   don't fight with utility classes in specificity. */
+@layer base {
+  body {
+    @apply bg-pitch-950 text-chalk-100 font-body;
+    /* @apply lets you use Tailwind utility classes inside regular CSS rules.
+       This sets the global background, text color, and font. */
+  }
+
+  * {
+    @apply border-pitch-800;
+    /* All borders default to our dark green color */
+  }
+}
+
+/* Scrollbar styling — webkit only (Chrome, Edge, Safari) */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-pitch-950;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-pitch-800 rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-grass-500;
+}
