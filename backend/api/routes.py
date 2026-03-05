@@ -31,20 +31,17 @@ from backend.db.schema import engine, Match, Summary, MatchEvent, Team, Competit
 api = Blueprint("api", __name__)
 
 # Create a SQLAlchemy session factory for read queries
-# This is separate from writer.py's get_session() — routes only
-# need to READ from the DB, not write. Same engine, same DB.
 SessionLocal = sessionmaker(bind=engine)
 
 
 # -------------------------------------------------------------------------
-# Helper
+# Helpers
 # -------------------------------------------------------------------------
 
 def _get_db():
     """
     Returns a new SQLAlchemy session.
     Caller is responsible for closing it.
-    Used in routes for read-only DB queries.
     """
     return SessionLocal()
 
@@ -53,14 +50,18 @@ def _match_to_dict(match: Match, session) -> dict:
     """
     Serializes a Match ORM object to a plain dict for JSON response.
 
-    Why do we need this?
-        Flask's jsonify() can't serialize SQLAlchemy ORM objects directly
-        because they're Python class instances, not basic types.
-        We manually extract the fields we want into a plain dict.
+    WHY has_summary EXISTS:
+        The frontend MatchCard component needs to know whether a summary
+        has been generated for each match so it can show "Analysis ready"
+        vs "No analysis yet". Rather than making the frontend fire a
+        separate request per match (50 extra requests for 50 cards),
+        we include this boolean directly in the matches list response.
+        This is called "eager loading" of related data — one query
+        that gives you everything you need in one response.
 
     Args:
         match: SQLAlchemy Match instance
-        session: Active DB session (needed to access relationships)
+        session: Active DB session (needed to query related tables)
 
     Returns:
         Dict with match fields suitable for JSON serialization.
@@ -70,6 +71,14 @@ def _match_to_dict(match: Match, session) -> dict:
     competition = session.query(Competition).filter_by(
         id=match.competition_id
     ).first()
+
+    # Check if a summary exists for this match.
+    # .first() returns None if no row found — bool(None) = False.
+    # bool(summary_row) = True if a row exists.
+    # This is a single lightweight query — just checks for existence.
+    summary_exists = session.query(Summary).filter_by(
+        match_id=match.id
+    ).first() is not None
 
     return {
         "id": match.id,
@@ -81,6 +90,7 @@ def _match_to_dict(match: Match, session) -> dict:
         "away_team": away_team.name if away_team else "Unknown",
         "home_score": match.home_score,
         "away_score": match.away_score,
+        "has_summary": summary_exists,   # NEW — drives MatchCard badge
     }
 
 
@@ -94,10 +104,6 @@ def health():
     GET /api/health
 
     Simple health check endpoint.
-    Used to verify the API is running without hitting the DB.
-    Standard practice in any web service — monitoring tools
-    ping this to check if the service is alive.
-
     Returns 200 with status "ok".
     """
     return jsonify({"status": "ok", "service": "football-analytics-api"})
@@ -117,22 +123,6 @@ def get_matches():
 
     Query parameters (optional):
         limit: max number of matches to return (default 20)
-
-    Example response:
-        [
-            {
-                "id": 538074,
-                "competition": "Premier League",
-                "matchday": 28,
-                "date": "2026-03-04",
-                "status": "FINISHED",
-                "home_team": "Newcastle United FC",
-                "away_team": "Manchester United FC",
-                "home_score": 2,
-                "away_score": 1
-            },
-            ...
-        ]
     """
     from flask import request
 
@@ -155,8 +145,6 @@ def get_matches():
         return jsonify({"error": str(e)}), 500
 
     finally:
-        # Always close the session — prevents connection leaks
-        # finally block runs whether or not an exception occurred
         session.close()
 
 
@@ -166,7 +154,6 @@ def get_match(match_id: int):
     GET /api/matches/<id>
 
     Returns details for a single match by its Football-Data.org ID.
-
     Returns 404 if match not found in DB.
     """
     session = _get_db()
@@ -195,9 +182,9 @@ def get_summary(match_id: int):
     GET /api/matches/<id>/summary
 
     Returns the AI-generated match analysis for a specific match.
-    Returns 404 if no summary has been generated yet for this match.
+    Returns 404 if no summary has been generated yet.
 
-    Example response:
+    Response shape:
         {
             "match_id": 538074,
             "content": "## THE STORY OF THE MATCH\n...",
@@ -238,9 +225,9 @@ def get_events(match_id: int):
     GET /api/matches/<id>/events
 
     Returns all match events (goals, cards, substitutions)
-    for a specific match, ordered chronologically by minute.
+    ordered chronologically by minute.
 
-    Example response:
+    Response shape:
         {
             "match_id": 538074,
             "events": [
@@ -252,14 +239,7 @@ def get_events(match_id: int):
                     "secondary_player": null,
                     "reason": "Foul"
                 },
-                {
-                    "type": "goal",
-                    "minute": 45,
-                    "player": "Anthony Gordon",
-                    "detail": "penalty",
-                    "secondary_player": null,
-                    "reason": null
-                }
+                ...
             ]
         }
     """
@@ -308,33 +288,20 @@ def run_pipeline():
     """
     POST /api/pipeline/run
 
-    Triggers the full ETL + summarization pipeline manually.
-    This is what n8n will call on a schedule instead of running
-    python -m backend.main directly.
+    Triggers the full ETL + summarization pipeline.
+    Synchronous — waits for completion before responding (~22s).
 
-    Why POST and not GET?
-        GET requests should only READ data — they should be safe
-        to call multiple times without side effects.
-        POST requests trigger actions or create/modify data.
-        Running the pipeline modifies the DB, so it's a POST.
+    WHY POST AND NOT GET:
+        GET requests must be side-effect free — safe to call
+        repeatedly. This endpoint writes to the DB, so it's a POST.
 
-    Returns the AI-generated summary for the latest match
-    after the pipeline completes.
-
-    Note: This is a synchronous endpoint — it waits for the
-    pipeline to finish before responding. For a ~22 second pipeline
-    that's acceptable. If it grows longer we'd move to async/background
-    tasks (Celery, RQ) — but that's over-engineering for now.
+    Returns the generated summary for the latest match.
     """
     try:
         from backend.main import run_pipeline as _run_pipeline
-        from backend.db.schema import Match, Summary
-        from sqlalchemy.orm import sessionmaker
 
-        # Run the full pipeline
         _run_pipeline()
 
-        # Fetch the summary that was just generated
         session = _get_db()
         try:
             latest_match = (
