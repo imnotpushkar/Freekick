@@ -33,6 +33,13 @@ HEADERS = {
     "X-RapidAPI-Host": HOST
 }
 
+HOST_INCIDENTS = "sofascore.p.rapidapi.com"
+BASE_URL_INCIDENTS = f"https://{HOST_INCIDENTS}"
+HEADERS_INCIDENTS = {
+    "x-rapidapi-key": RAPIDAPI_KEY,
+    "x-rapidapi-host": HOST_INCIDENTS,
+}
+
 REQUEST_DELAY = 1
 
 
@@ -78,6 +85,33 @@ def _get(endpoint: str, params: dict = None) -> any:
 # -------------------------------------------------------------------------
 # Public functions
 # -------------------------------------------------------------------------
+
+
+def _get_incidents(path: str, params: dict = None) -> any:
+    """
+    GET request to API Dojo SofaScore host (incidents).
+    sofascore.p.rapidapi.com — confirmed working for /matches/get-incidents.
+    """
+    url = f"{BASE_URL_INCIDENTS}{path}"
+    try:
+        response = requests.get(
+            url, headers=HEADERS_INCIDENTS, params=params, timeout=15
+        )
+        if response.status_code == 429:
+            print("Rate limit hit (incidents host). Waiting 60 seconds...")
+            time.sleep(60)
+            response = requests.get(
+                url, headers=HEADERS_INCIDENTS, params=params, timeout=15
+            )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.Timeout:
+        raise Exception(f"Request timed out: {url}")
+    except requests.exceptions.HTTPError as e:
+        raise Exception(f"HTTP {response.status_code} error: {e} — {url}")
+    except requests.exceptions.ConnectionError:
+        raise Exception(f"Connection error: {url}")
+
 
 def get_matches_by_date(date_str: str) -> list:
     """
@@ -192,6 +226,24 @@ def get_match_lineups(sofascore_match_id: int) -> dict:
     }
 
 
+
+def get_match_incidents(sofascore_match_id: int) -> dict:
+    """
+    Fetches match incidents (goals, cards, substitutions) using the
+    API Dojo SofaScore host. Returns raw dict with 'incidents' key.
+    Returns empty dict on failure.
+    """
+    data = _get_incidents(
+        "/matches/get-incidents", params={"matchId": str(sofascore_match_id)}
+    )
+    time.sleep(REQUEST_DELAY)
+
+    if not isinstance(data, dict):
+        return {}
+
+    return data
+
+
 def find_sofascore_match_id(matches: list, home_team: str,
                              away_team: str) -> int | None:
     """
@@ -255,10 +307,13 @@ def get_full_match_data(date_str: str, home_team: str,
     stats = get_match_statistics(match_id)
     lineups = get_match_lineups(match_id)
 
+    incidents = get_match_incidents(match_id)
+
     return {
         "match_id": match_id,
         "statistics": stats,
         "lineups": lineups,
+        "incidents": incidents,
     }
 
 
