@@ -11,6 +11,7 @@ Pipeline: scraper → cleaner → db writer / summarizer
 
 from datetime import datetime
 from typing import Optional
+from backend.processors.formation_roles import map_tactical_roles
 
 
 # -------------------------------------------------------------------------
@@ -91,8 +92,7 @@ def clean_team(raw: dict) -> dict:
 def clean_match(raw: dict, competition_id: int) -> dict:
     """
     Flattens a raw match dict into a clean structure.
-    Scheduled matches store None scores — not 0 — to avoid
-    implying a 0-0 result for unplayed games.
+    Scheduled matches store None scores to avoid implying 0-0.
 
     Args:
         raw: Single match dict from get_matches_by_competition()
@@ -184,11 +184,6 @@ def clean_sofascore_stats(raw_stats: dict, home_team: str,
     Flattens the SofaScore statistics dict into a structured context
     object ready for the AI summarizer.
 
-    SofaScore returns stats as {key: {home: val, away: val}}.
-    We reshape this into a human-readable dict separating
-    home and away perspectives, and pre-compute narrative hints
-    that give the AI concrete tactical angles to write about.
-
     Args:
         raw_stats: Output of get_match_statistics() from sofascore.py
         home_team: Home team name string
@@ -258,10 +253,6 @@ def clean_sofascore_stats(raw_stats: dict, home_team: str,
         "goals_prevented": _extract("goalsPrevented", "away"),
     }
 
-    # -----------------------------------------------------------------------
-    # Narrative hints — pre-computed tactical observations
-    # Give the AI concrete angles rather than raw numbers to interpret cold.
-    # -----------------------------------------------------------------------
     hints = []
 
     home_xg = _extract("expectedGoals", "home") or 0
@@ -338,11 +329,23 @@ def clean_sofascore_lineups(raw_lineups: dict) -> dict:
     """
     Cleans and structures lineup data from SofaScore.
 
+    Key behaviour:
+        - Filters starters from substitutes using substitute: False flag
+        - Only the starting 11 get tactical roles assigned
+        - Substitutes are included separately without tactical roles
+        - Tactical roles assigned via formation_roles.map_tactical_roles()
+
+    Why we filter by substitute flag rather than index:
+        SofaScore guarantees starters come first (indices 0-10) but
+        using the explicit substitute flag is more robust — if SofaScore
+        ever changes ordering, the flag stays reliable.
+
     Args:
         raw_lineups: Output of get_match_lineups() from sofascore.py
 
     Returns:
-        Dict with formations and formatted player lists per side.
+        Dict with formations, tactically enriched starters, and
+        a separate substitutes list per side.
     """
     if not raw_lineups:
         return {}
@@ -354,25 +357,60 @@ def clean_sofascore_lineups(raw_lineups: dict) -> dict:
         "F": "Forward",
     }
 
-    def _format_players(players: list) -> list:
-        return [
-            {
-                "name": p.get("name", "Unknown"),
-                "short_name": p.get("short_name", ""),
-                "position": position_map.get(
-                    p.get("position", ""), p.get("position", "Unknown")
-                ),
-                "jersey_number": p.get("jersey_number", "?"),
-            }
-            for p in players
-        ]
+    def _format_player(p: dict) -> dict:
+        return {
+            "id": p.get("id"),
+            "name": p.get("name", "Unknown"),
+            "short_name": p.get("short_name", ""),
+            "position": position_map.get(
+                p.get("position", ""), p.get("position", "Unknown")
+            ),
+            "jersey_number": p.get("jersey_number", "?"),
+        }
+
+    def _split_starters_subs(players: list) -> tuple[list, list]:
+        """
+        Splits player list into starters and substitutes.
+        Uses substitute flag: False = starter, True = bench.
+        Falls back to first 11 if flag missing on all players.
+        """
+        starters = [p for p in players if not p.get("substitute", True)]
+        subs = [p for p in players if p.get("substitute", False)]
+
+        # Fallback: if substitute flag missing, use first 11
+        if not starters:
+            starters = players[:11]
+            subs = players[11:]
+
+        return starters, subs
+
+    home_formation = raw_lineups.get("home_formation", "Unknown")
+    away_formation = raw_lineups.get("away_formation", "Unknown")
+
+    home_all = raw_lineups.get("home_players", [])
+    away_all = raw_lineups.get("away_players", [])
+
+    home_starters_raw, home_subs_raw = _split_starters_subs(home_all)
+    away_starters_raw, away_subs_raw = _split_starters_subs(away_all)
+
+    # Format players
+    home_starters = [_format_player(p) for p in home_starters_raw]
+    away_starters = [_format_player(p) for p in away_starters_raw]
+    home_subs = [_format_player(p) for p in home_subs_raw]
+    away_subs = [_format_player(p) for p in away_subs_raw]
+
+    # Assign tactical roles to starters only
+    home_starters = map_tactical_roles(home_starters, home_formation)
+    away_starters = map_tactical_roles(away_starters, away_formation)
 
     return {
         "confirmed": raw_lineups.get("confirmed", False),
-        "home_formation": raw_lineups.get("home_formation", "Unknown"),
-        "away_formation": raw_lineups.get("away_formation", "Unknown"),
-        "home_players": _format_players(raw_lineups.get("home_players", [])),
-        "away_players": _format_players(raw_lineups.get("away_players", [])),
+        "home_formation": home_formation,
+        "away_formation": away_formation,
+        "home_players": home_starters,
+        "away_players": away_starters,
+        "home_substitutes": home_subs,
+        "away_substitutes": away_subs,
     }
 
 
@@ -381,9 +419,6 @@ def build_match_context(match_data: dict, sofascore_stats: dict,
     """
     Combines Football-Data.org match data with SofaScore stats and
     lineups into a single rich context dict for the AI summarizer.
-
-    This is the final preparation step before the prompt is built.
-    Everything the AI needs for creator-quality analysis lives here.
 
     Args:
         match_data: Basic match info dict (teams, score, competition, date)
@@ -408,6 +443,8 @@ def build_match_context(match_data: dict, sofascore_stats: dict,
         "away_formation": sofascore_lineups.get("away_formation", "Unknown"),
         "home_players": sofascore_lineups.get("home_players", []),
         "away_players": sofascore_lineups.get("away_players", []),
+        "home_substitutes": sofascore_lineups.get("home_substitutes", []),
+        "away_substitutes": sofascore_lineups.get("away_substitutes", []),
         "lineups_confirmed": sofascore_lineups.get("confirmed", False),
     }
 
@@ -433,8 +470,3 @@ if __name__ == "__main__":
     print("Cleaned match:")
     for key, value in cleaned.items():
         print(f"  {key}: {value}")
-
-    teams = clean_teams_from_matches([sample_match])
-    print("\nCleaned teams:")
-    for t in teams:
-        print(f"  {t}")

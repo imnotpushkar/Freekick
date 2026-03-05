@@ -7,10 +7,14 @@ Uses three confirmed working endpoints:
     - match/statistics  — match-level stats (xG, possession, shots, etc.)
     - match/lineups     — confirmed lineups with formations and players
 
-SofaScore match IDs are different from Football-Data.org IDs.
-We bridge them by matching team names and date.
+Key findings from raw API inspection:
+    - substitute: False = starter, substitute: True = bench player
+    - positionsDetailed: [] — empty on free tier, no coordinate data
+    - Players ordered: starters first (indices 0-10), bench after (11+)
+    - position tag = natural position, NOT match role (e.g. Wolfe tagged
+      as D but played Left Wingback — role comes from formation_roles.py)
 
-Rate limit: depends on RapidAPI plan — add delay between requests.
+Rate limit: depends on RapidAPI plan — REQUEST_DELAY between calls.
 """
 
 import os
@@ -19,10 +23,6 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# -------------------------------------------------------------------------
-# Constants
-# -------------------------------------------------------------------------
 
 RAPIDAPI_KEY = os.getenv("RAPID_API_KEY")
 HOST = "sofascore6.p.rapidapi.com"
@@ -33,7 +33,7 @@ HEADERS = {
     "X-RapidAPI-Host": HOST
 }
 
-REQUEST_DELAY = 1  # seconds between requests
+REQUEST_DELAY = 1
 
 
 # -------------------------------------------------------------------------
@@ -42,8 +42,7 @@ REQUEST_DELAY = 1  # seconds between requests
 
 def _get(endpoint: str, params: dict = None) -> any:
     """
-    Internal GET request handler with error handling.
-    All public functions call this instead of requests.get() directly.
+    Internal GET request handler with error handling and rate limit retry.
 
     Args:
         endpoint: API path e.g. "/match/statistics"
@@ -90,39 +89,27 @@ def get_matches_by_date(date_str: str) -> list:
     Returns:
         List of match dicts. Each dict contains:
             - id: SofaScore match ID
-            - slug: URL-friendly match name
             - homeTeam/awayTeam: team info dicts
             - tournament: competition info
             - status: match status (finished, inprogress, etc.)
-            - startTimestamp: Unix timestamp of kickoff
     """
     data = _get("/match/list", params={"sport_slug": "football", "date": date_str})
     time.sleep(REQUEST_DELAY)
 
-    # Response is a list of match dicts directly
     if isinstance(data, list):
         return data
-    # Some responses wrap in a dict
     return data.get("events", []) if isinstance(data, dict) else []
 
 
 def get_match_statistics(sofascore_match_id: int) -> dict:
     """
     Fetches detailed match statistics for a single match.
-    Returns stats grouped by category (overview, shots, passes, etc.)
 
     Args:
         sofascore_match_id: SofaScore numeric match ID
 
     Returns:
-        Dict with keys:
-            - overview: ball possession, xG, shots, fouls, cards, passes, tackles
-            - shots: total, on target, off target, blocked, inside/outside box
-            - passes: accurate, long balls, crosses, final third entries
-            - duels: ground, aerial, dribbles
-            - defending: tackles won, interceptions, recoveries, clearances
-            - goalkeeping: saves, goals prevented
-
+        Flattened dict of {stat_key: {home, away, home_display, away_display}}
         Returns empty dict if stats unavailable.
     """
     data = _get("/match/statistics", params={"match_id": str(sofascore_match_id)})
@@ -131,13 +118,10 @@ def get_match_statistics(sofascore_match_id: int) -> dict:
     if not isinstance(data, list):
         return {}
 
-    # Find the ALL period (full match stats, not just first/second half)
     all_period = next((d for d in data if d.get("period") == "ALL"), None)
     if not all_period:
         return {}
 
-    # Flatten nested groups into a clean dict
-    # Structure: {stat_key: {"home": value, "away": value}}
     result = {}
     for group in all_period.get("groups", []):
         for stat in group.get("statisticsItems", []):
@@ -158,19 +142,23 @@ def get_match_lineups(sofascore_match_id: int) -> dict:
     """
     Fetches confirmed lineups for a match including formations.
 
+    Key behaviour:
+        - Returns ALL players (starters + substitutes)
+        - substitute: False = starter (indices 0-10 in returned list)
+        - substitute: True  = bench player (indices 11+ in returned list)
+        - positionsDetailed is empty on free tier — no coordinate data
+        - position tag reflects natural position, not match role
+
     Args:
         sofascore_match_id: SofaScore numeric match ID
 
     Returns:
         Dict with keys:
-            - confirmed: bool — whether lineups are official
-            - home_formation: str e.g. "3-5-1-1"
-            - away_formation: str e.g. "4-2-3-1"
-            - home_players: list of player dicts
-            - away_players: list of player dicts
-
-        Each player dict contains:
-            - id, name, short_name, position, jersey_number
+            - confirmed: bool
+            - home_formation, away_formation: str
+            - home_players, away_players: list of player dicts
+              Each player has: id, name, short_name, position,
+              jersey_number, substitute (bool)
     """
     data = _get("/match/lineups", params={"match_id": str(sofascore_match_id)})
     time.sleep(REQUEST_DELAY)
@@ -179,7 +167,10 @@ def get_match_lineups(sofascore_match_id: int) -> dict:
         return {}
 
     def _extract_players(side_data: dict) -> list:
-        """Extracts and normalizes player list from a lineup side."""
+        """
+        Extracts player list preserving substitute flag.
+        substitute: False = starter, substitute: True = bench.
+        """
         players = []
         for p in side_data.get("players", []):
             players.append({
@@ -188,6 +179,7 @@ def get_match_lineups(sofascore_match_id: int) -> dict:
                 "short_name": p.get("shortName"),
                 "position": p.get("position"),
                 "jersey_number": p.get("jerseyNumber"),
+                "substitute": p.get("substitute", True),
             })
         return players
 
@@ -203,13 +195,8 @@ def get_match_lineups(sofascore_match_id: int) -> dict:
 def find_sofascore_match_id(matches: list, home_team: str,
                              away_team: str) -> int | None:
     """
-    Finds a SofaScore match ID by matching team names from a match list.
-    Bridges Football-Data.org team names with SofaScore team names.
-
-    Name matching is fuzzy — removes common suffixes like "FC", "United",
-    etc. and does partial matching because the two APIs use different
-    naming conventions.
-    e.g. "Wolverhampton Wanderers FC" vs "Wolverhampton"
+    Finds a SofaScore match ID by fuzzy-matching team names.
+    Bridges Football-Data.org team names with SofaScore names.
 
     Args:
         matches: Output of get_matches_by_date()
@@ -220,7 +207,6 @@ def find_sofascore_match_id(matches: list, home_team: str,
         SofaScore match ID integer, or None if not found.
     """
     def _normalize(name: str) -> str:
-        """Strips common suffixes and lowercases for comparison."""
         name = name.lower()
         for suffix in [" fc", " united", " city", " wanderers",
                        " rovers", " athletic", " albion", " hotspur"]:
@@ -234,7 +220,6 @@ def find_sofascore_match_id(matches: list, home_team: str,
         ss_home = _normalize(match.get("homeTeam", {}).get("name", ""))
         ss_away = _normalize(match.get("awayTeam", {}).get("name", ""))
 
-        # Check if normalized names match in either direction
         if (home_norm in ss_home or ss_home in home_norm) and \
            (away_norm in ss_away or ss_away in away_norm):
             return match.get("id")
@@ -245,10 +230,7 @@ def find_sofascore_match_id(matches: list, home_team: str,
 def get_full_match_data(date_str: str, home_team: str,
                         away_team: str) -> dict | None:
     """
-    Convenience function that chains all three API calls:
-    1. Get match list for the date
-    2. Find the specific match ID
-    3. Fetch statistics and lineups
+    Chains all three API calls into one convenience function.
 
     Args:
         date_str: Match date "YYYY-MM-DD"
@@ -287,28 +269,14 @@ def get_full_match_data(date_str: str, home_team: str,
 if __name__ == "__main__":
     print("Testing SofaScore scraper...\n")
 
-    result = get_full_match_data(
-        date_str="2026-03-03",
-        home_team="Wolverhampton Wanderers FC",
-        away_team="Liverpool FC"
-    )
+    raw_data = _get("/match/lineups", params={"match_id": "14023985"})
 
-    if result:
-        print(f"\nMatch ID: {result['match_id']}")
-
-        print("\n--- Key Statistics ---")
-        stats = result["statistics"]
-        key_stats = ["ballPossession", "expectedGoals", "totalShots",
-                     "passes", "tackles", "yellowCards"]
-        for key in key_stats:
-            if key in stats:
-                s = stats[key]
-                print(f"  {s['name']}: Home={s['home_display']} Away={s['away_display']}")
-
-        print("\n--- Lineups ---")
-        lineups = result["lineups"]
-        print(f"  Confirmed: {lineups.get('confirmed')}")
-        print(f"  Home formation: {lineups.get('home_formation')}")
-        print(f"  Away formation: {lineups.get('away_formation')}")
-        print(f"  Home players: {len(lineups.get('home_players', []))}")
-        print(f"  Away players: {len(lineups.get('away_players', []))}")
+    print("--- Home players with substitute flag ---")
+    home_raw = raw_data.get("home", {}).get("players", [])
+    for i, p in enumerate(home_raw):
+        sub_flag = p.get("substitute", "?")
+        label = "BENCH  " if sub_flag else "START  "
+        print(f"  [{i:02d}] {label} | "
+              f"{p.get('name'):25} | "
+              f"pos={p.get('position'):3} | "
+              f"jersey={p.get('jerseyNumber')}")
