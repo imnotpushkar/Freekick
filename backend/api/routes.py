@@ -23,14 +23,11 @@ Blueprint:
     Example: @api.route("/matches") becomes GET /api/matches
 """
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 from sqlalchemy.orm import sessionmaker
 from backend.db.schema import engine, Match, Summary, MatchEvent, Team, Competition
 
-# Create the Blueprint — 'api' is its internal name
 api = Blueprint("api", __name__)
-
-# Create a SQLAlchemy session factory for read queries
 SessionLocal = sessionmaker(bind=engine)
 
 
@@ -39,10 +36,6 @@ SessionLocal = sessionmaker(bind=engine)
 # -------------------------------------------------------------------------
 
 def _get_db():
-    """
-    Returns a new SQLAlchemy session.
-    Caller is responsible for closing it.
-    """
     return SessionLocal()
 
 
@@ -51,20 +44,12 @@ def _match_to_dict(match: Match, session) -> dict:
     Serializes a Match ORM object to a plain dict for JSON response.
 
     WHY has_summary EXISTS:
-        The frontend MatchCard component needs to know whether a summary
-        has been generated for each match so it can show "Analysis ready"
-        vs "No analysis yet". Rather than making the frontend fire a
-        separate request per match (50 extra requests for 50 cards),
-        we include this boolean directly in the matches list response.
-        This is called "eager loading" of related data — one query
-        that gives you everything you need in one response.
-
-    Args:
-        match: SQLAlchemy Match instance
-        session: Active DB session (needed to query related tables)
-
-    Returns:
-        Dict with match fields suitable for JSON serialization.
+        The frontend MatchCard needs to know whether a summary exists
+        so it can show "Analysis ready" vs "No analysis yet".
+        We include this boolean in the matches list response rather
+        than making the frontend fire a separate request per match
+        (that would be 50 extra requests for 50 cards). One query
+        that gives you everything you need — this is called eager loading.
     """
     home_team = session.query(Team).filter_by(id=match.home_team_id).first()
     away_team = session.query(Team).filter_by(id=match.away_team_id).first()
@@ -72,10 +57,6 @@ def _match_to_dict(match: Match, session) -> dict:
         id=match.competition_id
     ).first()
 
-    # Check if a summary exists for this match.
-    # .first() returns None if no row found — bool(None) = False.
-    # bool(summary_row) = True if a row exists.
-    # This is a single lightweight query — just checks for existence.
     summary_exists = session.query(Summary).filter_by(
         match_id=match.id
     ).first() is not None
@@ -83,6 +64,7 @@ def _match_to_dict(match: Match, session) -> dict:
     return {
         "id": match.id,
         "competition": competition.name if competition else "Unknown",
+        "competition_code": competition.code if competition else None,
         "matchday": match.matchday,
         "date": match.utc_date.strftime("%Y-%m-%d") if match.utc_date else None,
         "status": match.status,
@@ -100,12 +82,7 @@ def _match_to_dict(match: Match, session) -> dict:
 
 @api.route("/health")
 def health():
-    """
-    GET /api/health
-
-    Simple health check endpoint.
-    Returns 200 with status "ok".
-    """
+    """GET /api/health — simple liveness check."""
     return jsonify({"status": "ok", "service": "football-analytics-api"})
 
 
@@ -118,56 +95,66 @@ def get_matches():
     """
     GET /api/matches
 
-    Returns all finished matches stored in the DB,
-    ordered by date descending (most recent first).
+    Returns finished matches ordered by date descending.
 
-    Query parameters (optional):
-        limit: max number of matches to return (default 20)
+    Query parameters:
+        limit:       max results (default 20)
+        competition: filter by competition code e.g. ?competition=PL
+                     If omitted, returns matches across all competitions.
+
+    WHY A QUERY PARAMETER INSTEAD OF A URL SEGMENT:
+        /api/matches/PL would suggest PL is a specific match resource.
+        /api/matches?competition=PL makes it clear PL is a filter on
+        the matches collection — semantically correct REST design.
+        Query parameters are for filtering, sorting, and pagination.
+        URL segments are for identifying specific resources.
+
+    The competition filter joins to the Competition table to match
+    by code (e.g. "PL") rather than by the full name string, which
+    is more robust if names change slightly.
     """
-    from flask import request
-
     limit = request.args.get("limit", 20, type=int)
+    competition_code = request.args.get("competition", None)
 
     session = _get_db()
     try:
-        matches = (
+        query = (
             session.query(Match)
             .filter(Match.status == "FINISHED")
             .order_by(Match.utc_date.desc())
-            .limit(limit)
-            .all()
         )
 
+        # If a competition code filter is provided, join to Competition
+        # table and filter by code. This means ?competition=PL only
+        # returns Premier League matches.
+        if competition_code:
+            query = (
+                query
+                .join(Competition, Match.competition_id == Competition.id)
+                .filter(Competition.code == competition_code)
+            )
+
+        matches = query.limit(limit).all()
         result = [_match_to_dict(m, session) for m in matches]
         return jsonify(result)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     finally:
         session.close()
 
 
 @api.route("/matches/<int:match_id>")
 def get_match(match_id: int):
-    """
-    GET /api/matches/<id>
-
-    Returns details for a single match by its Football-Data.org ID.
-    Returns 404 if match not found in DB.
-    """
+    """GET /api/matches/<id> — single match detail."""
     session = _get_db()
     try:
         match = session.query(Match).filter_by(id=match_id).first()
-
         if not match:
             return jsonify({"error": f"Match {match_id} not found"}), 404
-
         return jsonify(_match_to_dict(match, session))
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     finally:
         session.close()
 
@@ -181,20 +168,12 @@ def get_summary(match_id: int):
     """
     GET /api/matches/<id>/summary
 
-    Returns the AI-generated match analysis for a specific match.
-    Returns 404 if no summary has been generated yet.
-
-    Response shape:
-        {
-            "match_id": 538074,
-            "content": "## THE STORY OF THE MATCH\n...",
-            "generated_at": "2026-03-05T14:22:11"
-        }
+    Returns the AI-generated match analysis.
+    404 if no summary generated yet.
     """
     session = _get_db()
     try:
         summary = session.query(Summary).filter_by(match_id=match_id).first()
-
         if not summary:
             return jsonify({
                 "error": f"No summary found for match {match_id}. "
@@ -207,10 +186,8 @@ def get_summary(match_id: int):
             "generated_at": summary.generated_at.isoformat()
             if summary.generated_at else None,
         })
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     finally:
         session.close()
 
@@ -226,22 +203,6 @@ def get_events(match_id: int):
 
     Returns all match events (goals, cards, substitutions)
     ordered chronologically by minute.
-
-    Response shape:
-        {
-            "match_id": 538074,
-            "events": [
-                {
-                    "type": "card",
-                    "minute": 26,
-                    "player": "Jacob Ramsey",
-                    "detail": "yellow",
-                    "secondary_player": null,
-                    "reason": "Foul"
-                },
-                ...
-            ]
-        }
     """
     session = _get_db()
     try:
@@ -274,7 +235,6 @@ def get_events(match_id: int):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     finally:
         session.close()
 
@@ -288,49 +248,51 @@ def run_pipeline():
     """
     POST /api/pipeline/run
 
-    Triggers the full ETL + summarization pipeline.
-    Processes all unanalysed matches from the latest finished matchday.
+    Triggers the ETL + summarization pipeline.
+    Processes all unanalysed matches from the most complete matchday.
 
-    WHY POST AND NOT GET:
-        GET requests must be side-effect free — safe to call
-        repeatedly. This endpoint writes to the DB, so it's a POST.
+    Optional JSON body:
+        { "competition": "CL" }   — run for a specific competition
+        Omit body or competition for default (Premier League auto mode).
 
     WHY SYNCHRONOUS:
-        For a free-tier project, async job queues (Celery, RQ) add
-        significant complexity. The pipeline takes ~2-3 minutes for
-        a full matchday. The frontend PipelineButton shows a loading
-        spinner during this time — acceptable UX for a dev tool.
+        Async job queues (Celery, RQ) add significant complexity.
+        The pipeline takes 2-3 minutes for a full matchday. The frontend
+        PipelineButton shows a spinner during this time — acceptable UX
+        for a development tool at this stage of the project.
 
     Response shape:
         {
             "status": "pipeline_complete",
-            "analysed": 9,
+            "competition": "Premier League",
+            "analysed": 8,
             "failed": 0,
-            "already_done": 1,
-            "results": [
-                {
-                    "match_id": 538074,
-                    "home_team": "Newcastle United FC",
-                    "away_team": "Manchester United FC",
-                    "status": "ok"
-                },
-                ...
-            ]
+            "results": [ { "match_id": ..., "status": "ok" }, ... ]
         }
     """
     try:
-        from backend.main import run_pipeline as _run_pipeline
+        from backend.main import run_pipeline as _run_pipeline, COMPETITIONS
 
-        results = _run_pipeline()
+        # Read optional competition from JSON body
+        # request.get_json() returns None if body is empty or not JSON
+        body = request.get_json(silent=True) or {}
+        competition_code = body.get("competition", "PL")
+
+        if competition_code not in COMPETITIONS:
+            return jsonify({
+                "error": f"Unknown competition: {competition_code}",
+                "supported": list(COMPETITIONS.keys()),
+            }), 400
+
+        comp_name = COMPETITIONS[competition_code]["name"]
+        results = _run_pipeline(competition_code=competition_code)
 
         ok_count   = sum(1 for r in results if r["status"] == "ok")
         fail_count = sum(1 for r in results if r["status"] == "error")
 
-        # Count how many were already done (not in results — they were skipped)
-        # We report this from the pipeline's own console output, but for the
-        # API response we just report what was processed this run.
         return jsonify({
             "status": "pipeline_complete",
+            "competition": comp_name,
             "analysed": ok_count,
             "failed": fail_count,
             "results": results,

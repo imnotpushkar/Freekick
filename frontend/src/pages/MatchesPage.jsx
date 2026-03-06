@@ -1,19 +1,32 @@
 // src/pages/MatchesPage.jsx
 //
-// Home page — hero section with GiveAndGo animation above match list.
+// Reusable match list page — used by all competition pages.
 //
-// Layout:
-//   [Navbar + Ticker — fixed, handled by App.jsx]
-//   [Hero section — full viewport height, GiveAndGo animation centred]
-//   [Match list — scrollable below]
+// PROPS:
+//   competition: object with shape:
+//     {
+//       code:      "PL"               — passed to API as ?competition=PL
+//       name:      "Premier League"   — shown in hero eyebrow
+//       label:     "PREMIER LEAGUE"   — shown in hero heading
+//       Badge:     <Component />      — SVG badge component from Navbar
+//     }
 //
-// The hero section uses 100dvh (dynamic viewport height) minus the
-// navbar (56px) and ticker (32px) = 88px total offset. This means
-// the hero fills exactly the visible screen on first load, with the
-// match list starting just below the fold — user scrolls to see it.
+// WHY PROPS INSTEAD OF SEPARATE PAGE FILES:
+//   All competition pages share identical layout and behaviour.
+//   The only differences are the API filter code and the hero text.
+//   Passing these as props means one component handles everything —
+//   no code duplication. Each competition page file is just 10 lines.
 //
-// The dot grid + vignette are pure CSS — no JS, no extra components.
-// They're layered via ::before and ::after equivalents using divs.
+// API CALL:
+//   /api/matches?competition=PL&limit=20
+//   The backend joins to the Competition table and filters by code.
+//   No competition code = all competitions returned (not used here).
+//
+// MATCH GROUPING:
+//   Previously MatchesPage grouped matches by competition using
+//   byCompetition reduce(). That was needed when one page showed
+//   all competitions. Now each page is one competition — the grouping
+//   is replaced with a simpler matchday grouping instead.
 
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -22,19 +35,39 @@ import MatchTransition from '../components/MatchTransition'
 import GiveAndGo from '../components/animations/GiveAndGo'
 import apiClient from '../api/client'
 
-export default function MatchesPage() {
-  const [matches, setMatches]                   = useState([])
-  const [loading, setLoading]                   = useState(true)
-  const [error, setError]                       = useState(null)
-  const [transitionState, setTransitionState]   = useState(null)
+// Default competition config — Premier League
+// Used when MatchesPage is rendered without props (direct route to /)
+const DEFAULT_COMPETITION = {
+  code:  'PL',
+  name:  'Premier League',
+  label: 'PREMIER LEAGUE',
+}
+
+export default function MatchesPage({ competition = DEFAULT_COMPETITION }) {
+  const [matches, setMatches]                 = useState([])
+  const [loading, setLoading]                 = useState(true)
+  const [error, setError]                     = useState(null)
+  const [transitionState, setTransitionState] = useState(null)
   const navigate = useNavigate()
 
+  // Re-fetch when competition changes (user switches tab in navbar)
+  // The competition.code in the dependency array ensures a new fetch
+  // fires whenever the user navigates to a different competition page.
   useEffect(() => {
-    apiClient.get('/api/matches')
+    setLoading(true)
+    setError(null)
+    setMatches([])
+
+    apiClient.get('/api/matches', {
+      params: {
+        competition: competition.code,
+        limit: 20,
+      }
+    })
       .then(res => setMatches(res.data))
       .catch(() => setError('Could not load matches. Is the Flask API running?'))
       .finally(() => setLoading(false))
-  }, [])
+  }, [competition.code])
 
   const handleMatchClick = (match, animationType) => {
     setTransitionState({ match, animationType })
@@ -46,17 +79,34 @@ export default function MatchesPage() {
     if (id) navigate(`/matches/${id}`)
   }
 
-  // ── Loading state ──────────────────────────────────────────────────────────
+  // Group matches by matchday for display
+  // reduce() builds an object: { 29: [...matches], 28: [...matches] }
+  // Object.entries() then converts it to pairs we can map over
+  const byMatchday = matches.reduce((acc, match) => {
+    const md = match.matchday || 'Unknown'
+    if (!acc[md]) acc[md] = []
+    acc[md].push(match)
+    return acc
+  }, {})
+
+  // Sort matchdays descending (most recent first)
+  const sortedMatchdays = Object.keys(byMatchday)
+    .map(Number)
+    .sort((a, b) => b - a)
+
+  // ── Loading state ────────────────────────────────────────────────────────
   if (loading) {
     return (
       <div className="max-w-6xl mx-auto px-6 py-12 flex items-center gap-3 text-textmuted">
         <span className="w-4 h-4 border-2 border-textmuted border-t-transparent rounded-full animate-spin inline-block"/>
-        <span className="font-condensed tracking-widest uppercase text-xs">Loading matches...</span>
+        <span className="font-condensed tracking-widest uppercase text-xs">
+          Loading {competition.name} matches...
+        </span>
       </div>
     )
   }
 
-  // ── Error state ────────────────────────────────────────────────────────────
+  // ── Error state ──────────────────────────────────────────────────────────
   if (error) {
     return (
       <div className="max-w-6xl mx-auto px-6 py-12">
@@ -70,16 +120,9 @@ export default function MatchesPage() {
     )
   }
 
-  const byCompetition = matches.reduce((acc, match) => {
-    const comp = match.competition || 'Other'
-    if (!acc[comp]) acc[comp] = []
-    acc[comp].push(match)
-    return acc
-  }, {})
-
   return (
     <>
-      {/* ── Transition overlay — mounts on card click ───────────────────── */}
+      {/* ── Transition overlay — mounts on card click ─────────────────────── */}
       {transitionState && (
         <MatchTransition
           animationType={transitionState.animationType}
@@ -88,17 +131,16 @@ export default function MatchesPage() {
         />
       )}
 
-      {/* ── HERO SECTION ────────────────────────────────────────────────── */}
-      {/* 
+      {/* ── HERO SECTION ──────────────────────────────────────────────────── */}
+      {/*
         Height: calc(100dvh - 88px) accounts for navbar (56px) + ticker (32px).
         dvh = dynamic viewport height — handles mobile browser chrome correctly.
-        Falls back to 100vh on browsers that don't support dvh.
       */}
       <div
         style={{ height: 'calc(100dvh - 88px)', minHeight: 480 }}
         className="relative flex flex-col items-center justify-center overflow-hidden bg-bg"
       >
-        {/* Dot grid background — radial gradient dots */}
+        {/* Dot grid background */}
         <div
           className="absolute inset-0 pointer-events-none"
           style={{
@@ -107,7 +149,7 @@ export default function MatchesPage() {
           }}
         />
 
-        {/* Vignette — fades dot grid toward edges */}
+        {/* Vignette */}
         <div
           className="absolute inset-0 pointer-events-none"
           style={{
@@ -115,7 +157,7 @@ export default function MatchesPage() {
           }}
         />
 
-        {/* Ground line — sits below the animation */}
+        {/* Ground line */}
         <div
           className="absolute pointer-events-none"
           style={{
@@ -139,20 +181,23 @@ export default function MatchesPage() {
           }}
         />
 
-        {/* Hero content — centred */}
+        {/* Hero content */}
         <div className="relative z-10 flex flex-col items-center text-center">
 
-          {/* Eyebrow */}
+          {/* Eyebrow — competition name */}
           <p className="font-condensed text-xs font-bold tracking-widest uppercase text-fkgreenbright mb-3">
-            Premier League · Match Intelligence
+            {competition.name} · Match Intelligence
           </p>
 
-          {/* Logo wordmark */}
+          {/* Wordmark */}
           <h1
             className="font-display text-textprimary leading-none mb-3"
             style={{ fontSize: 'clamp(72px, 12vw, 120px)', letterSpacing: 6 }}
           >
-            FREE<span className="text-fkgreenbright" style={{ textShadow: '0 0 60px rgba(69,196,102,0.35)' }}>KICK</span>
+            FREE<span
+              className="text-fkgreenbright"
+              style={{ textShadow: '0 0 60px rgba(69,196,102,0.35)' }}
+            >KICK</span>
           </h1>
 
           {/* Subtitle */}
@@ -160,12 +205,12 @@ export default function MatchesPage() {
             Creator-quality tactical analysis
           </p>
 
-          {/* GiveAndGo animation — trademark home page loop */}
+          {/* GiveAndGo animation */}
           <GiveAndGo />
 
         </div>
 
-        {/* Scroll hint — blinks at bottom */}
+        {/* Scroll hint */}
         <p
           className="absolute bottom-6 font-condensed text-xs tracking-widest uppercase text-textmuted"
           style={{ animation: 'fk-blink 2.2s ease-in-out infinite' }}
@@ -174,7 +219,7 @@ export default function MatchesPage() {
         </p>
       </div>
 
-      {/* ── MATCH LIST ──────────────────────────────────────────────────── */}
+      {/* ── MATCH LIST ────────────────────────────────────────────────────── */}
       <div className="max-w-6xl mx-auto px-6 py-8">
 
         {/* Section header */}
@@ -184,7 +229,7 @@ export default function MatchesPage() {
               MATCH ANALYSIS
             </h2>
             <p className="font-condensed text-xs text-textmuted tracking-widest uppercase mt-1">
-              {matches.length} matches · click any match to read
+              {competition.name} · {matches.length} matches · click any match to read
             </p>
           </div>
         </div>
@@ -192,25 +237,28 @@ export default function MatchesPage() {
         {matches.length === 0 ? (
           <div className="bg-surface border border-bdr p-8 text-center">
             <p className="text-textmuted font-condensed">
-              No matches found. Run the pipeline to fetch data.
+              No {competition.name} matches found. Run the pipeline to fetch data.
+            </p>
+            <p className="text-textmuted text-xs font-condensed mt-2 opacity-60">
+              python -m backend.main --competition {competition.code}
             </p>
           </div>
         ) : (
-          Object.entries(byCompetition).map(([competition, compMatches]) => (
-            <div key={competition} className="mb-10">
-              {/* Competition header */}
+          sortedMatchdays.map(md => (
+            <div key={md} className="mb-10">
+              {/* Matchday header */}
               <div className="bg-surface3 border-l-4 border-fkgreen border-b border-bdr px-6 py-2.5 flex items-center gap-4">
                 <span className="font-condensed text-xs font-bold tracking-widest uppercase text-textprimary">
-                  {competition}
+                  Matchday {md}
                 </span>
                 <div className="flex-1 h-px bg-bdr"/>
                 <span className="font-condensed text-xs text-fkgreenbright tracking-wider">
-                  {compMatches.length} matches
+                  {byMatchday[md].length} matches
                 </span>
               </div>
-              {/* Flush newspaper card grid */}
+              {/* Card grid */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 border-l border-t border-bdr">
-                {compMatches.map(match => (
+                {byMatchday[md].map(match => (
                   <div key={match.id} className="border-r border-b border-bdr">
                     <MatchCard match={match} onMatchClick={handleMatchClick}/>
                   </div>

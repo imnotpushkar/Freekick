@@ -1,12 +1,12 @@
 """
 backend/main.py
 
-Orchestrates the full pipeline:
+Orchestrates the full pipeline for any supported competition:
     1. Initialize database
     2. Fetch matches from Football-Data.org API
     3. Clean and store competitions, teams, matches
-    4. Find unanalysed matches — either from the most complete matchday
-       (default) or from a specific matchday (via target_matchday param)
+    4. Find unanalysed matches — most complete matchday (auto)
+       or a specific matchday (--matchday N)
     5. For each unanalysed match:
        a. Fetch SofaScore stats and lineups
        b. Fetch SofaScore incidents (goals, cards, subs)
@@ -14,28 +14,36 @@ Orchestrates the full pipeline:
        d. Save summary and events to DB
     6. Sleep 3s between matches to respect Groq rate limits
 
-RUNNING THE PIPELINE:
+CLI USAGE:
 
-    Default mode — processes most complete unfinished matchday:
+    Default — Premier League, auto matchday detection:
         python -m backend.main
 
-    Backfill mode — processes a specific matchday:
-        python -m backend.main --matchday 28
+    Specific competition:
+        python -m backend.main --competition CL
+        python -m backend.main --competition PD
+        python -m backend.main --competition BL1
+        python -m backend.main --competition SA
 
-    The --matchday flag is for backfilling historical data.
-    The frontend "Run Pipeline" button always uses default mode.
+    Specific competition + specific matchday (backfill):
+        python -m backend.main --competition CL --matchday 6
+        python -m backend.main --competition PD --matchday 25
 
-WHY target_matchday IS OPTIONAL:
-    The pipeline needs two modes:
-    1. Live mode (no argument): auto-detects the most complete matchday.
-       This is what the frontend button triggers — it should always
-       process the latest available round without manual input.
-    2. Backfill mode (--matchday N): targets a specific historical round.
-       This is for catching up on older matchdays that have no summaries.
-       You control the pace, avoiding Groq daily token limits.
+SUPPORTED COMPETITION CODES (football-data.org free tier):
+    PL   Premier League
+    CL   UEFA Champions League
+    PD   La Liga (Primera Division)
+    BL1  Bundesliga
+    SA   Serie A
+    FL1  Ligue 1
 
-    Both modes share all the same step functions — only the matchday
-    selection logic differs.
+WHY A LOOKUP TABLE FOR COMPETITION METADATA:
+    The Football-Data.org API uses numeric IDs internally (PL=2021,
+    CL=2001 etc.) but exposes competition codes as strings in URLs.
+    We need both — the code for the API request URL, the numeric ID
+    for our DB foreign key, and the name string for the AI prompt.
+    Storing all three in one dict avoids passing three separate args
+    everywhere and makes adding new competitions a one-line change.
 """
 
 import sys
@@ -73,18 +81,29 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 # -------------------------------------------------------------------------
-# Configuration
+# Competition registry
 # -------------------------------------------------------------------------
 
-TARGET_COMPETITION_CODE = "PL"
-TARGET_COMPETITION_ID = 2021
-TARGET_COMPETITION_NAME = "Premier League"
+# All competitions supported by football-data.org free tier that we cover.
+# Each entry: code -> { id, name }
+#   code: the string used in API URLs and CLI --competition flag
+#   id:   numeric ID used in our DB and some API endpoints
+#   name: human-readable name passed to the AI summarizer prompt
+COMPETITIONS = {
+    "PL":  {"id": 2021, "name": "Premier League"},
+    "CL":  {"id": 2001, "name": "UEFA Champions League"},
+    "PD":  {"id": 2014, "name": "La Liga"},
+    "BL1": {"id": 2002, "name": "Bundesliga"},
+    "SA":  {"id": 2019, "name": "Serie A"},
+    "FL1": {"id": 2015, "name": "Ligue 1"},
+}
+
+# Default competition when none specified
+DEFAULT_COMPETITION = "PL"
 
 # Seconds to wait between Groq API calls.
 # Groq free tier: 30 requests/minute, 6000 tokens/minute on llama-3.3-70b.
-# Each summary uses ~1500 tokens output + ~800 input = ~2300 tokens.
-# At 6000 tokens/minute we can do ~2.6 matches/minute safely.
-# 3 seconds between calls keeps us well within this limit.
+# Each summary ~2300 tokens. 3s gap keeps us safely within limits.
 GROQ_DELAY_SECONDS = 3
 
 
@@ -102,8 +121,9 @@ def step_init():
 def step_fetch_and_store(competition_code: str,
                          competition_id: int) -> list:
     """
-    Step 2: Fetch matches from Football-Data.org, clean, save to DB.
-    Skips matches already in DB to avoid redundant API calls.
+    Step 2: Fetch all matches for a competition from Football-Data.org.
+    Saves new competitions, teams, and matches to DB.
+    Skips matches already in DB — idempotent, safe to re-run.
 
     Returns:
         List of all raw match dicts from the API.
@@ -144,29 +164,18 @@ def step_get_unanalysed_matches(raw_matches: list,
     """
     Step 3: Find finished matches that need summarizing.
 
-    Two modes depending on target_matchday:
-
     AUTO MODE (target_matchday=None):
-        Counts finished matches per matchday and picks the one with
-        the highest count. This handles out-of-order fixtures — a lone
-        MD31 match won't beat a nearly-complete MD29 with 9 finished.
-        Tiebreak: higher matchday number wins (more recent round).
+        Counts finished matches per matchday, picks the most complete.
+        Handles out-of-order fixtures — one lone MD31 match won't
+        beat a nearly-complete MD29 with 9 finished.
 
     BACKFILL MODE (target_matchday=N):
-        Directly targets matchday N. Useful for processing historical
-        rounds that were skipped. The auto-detection logic is bypassed
-        entirely — we just go straight to that matchday.
+        Directly targets matchday N. For catching up on historical rounds.
 
-    Both modes skip matches that already have a summary in the DB,
-    making every pipeline run idempotent (safe to re-run).
-
-    Args:
-        raw_matches:     All matches from the API for this competition.
-        target_matchday: Specific matchday to process. None = auto-detect.
+    Both modes skip matches that already have summaries — idempotent.
 
     Returns:
-        List of raw match dicts that need summarizing, sorted
-        chronologically by kick-off time.
+        List of raw match dicts sorted chronologically by kick-off time.
     """
     finished = [m for m in raw_matches if m.get("status") == "FINISHED"]
 
@@ -177,15 +186,12 @@ def step_get_unanalysed_matches(raw_matches: list,
     if target_matchday is not None:
         # --- BACKFILL MODE ---
         print(f"[3/5] Backfill mode — targeting MD{target_matchday}...")
-
         matchday_matches = [
             m for m in finished if m.get("matchday") == target_matchday
         ]
-
         if not matchday_matches:
             print(f"      No finished matches found for MD{target_matchday}.\n")
             return []
-
         total_in_md = sum(
             1 for m in raw_matches if m.get("matchday") == target_matchday
         )
@@ -194,15 +200,12 @@ def step_get_unanalysed_matches(raw_matches: list,
     else:
         # --- AUTO MODE ---
         print("[3/5] Finding unanalysed matches from most complete matchday...")
-
-        # Count finished matches per matchday
         matchday_counts = {}
         for m in finished:
             md = m.get("matchday", 0)
             matchday_counts[md] = matchday_counts.get(md, 0) + 1
 
-        # Pick matchday with most finished matches.
-        # Tiebreak: higher matchday number = more recent round wins.
+        # Most finished matches wins. Tiebreak: higher matchday = more recent.
         chosen_md = max(
             matchday_counts,
             key=lambda md: (matchday_counts[md], md)
@@ -211,15 +214,13 @@ def step_get_unanalysed_matches(raw_matches: list,
         total_in_md = sum(
             1 for m in raw_matches if m.get("matchday") == chosen_md
         )
-
         print(f"      Most complete matchday: MD{chosen_md} "
               f"({finished_count}/{total_in_md} finished)")
-
         matchday_matches = [
             m for m in finished if m.get("matchday") == chosen_md
         ]
 
-    # Check which matches already have summaries — skip those
+    # Skip matches that already have summaries
     session = SessionLocal()
     try:
         existing_summary_ids = {
@@ -233,8 +234,6 @@ def step_get_unanalysed_matches(raw_matches: list,
         m for m in matchday_matches
         if m.get("id") not in existing_summary_ids
     ]
-
-    # Sort by kick-off time — process chronologically
     unanalysed.sort(key=lambda m: m.get("utcDate", ""))
 
     already_done = len(matchday_matches) - len(unanalysed)
@@ -245,13 +244,7 @@ def step_get_unanalysed_matches(raw_matches: list,
 
 
 def step_fetch_sofascore_data(raw_match: dict) -> dict:
-    """
-    Fetch SofaScore statistics and lineups for a single match.
-
-    Returns:
-        Dict with stats, lineups, raw_incidents keys.
-        Returns empty dict on failure — pipeline continues without stats.
-    """
+    """Fetch SofaScore statistics and lineups for a single match."""
     from backend.scrapers.sofascore import get_full_match_data
 
     home_team = raw_match.get("homeTeam", {}).get("name", "")
@@ -262,7 +255,6 @@ def step_fetch_sofascore_data(raw_match: dict) -> dict:
 
     try:
         result = get_full_match_data(date_str, home_team, away_team)
-
         if not result:
             print("      Not found on SofaScore — using match data only.")
             return {}
@@ -271,7 +263,6 @@ def step_fetch_sofascore_data(raw_match: dict) -> dict:
             result["statistics"], home_team, away_team
         )
         cleaned_lineups = clean_sofascore_lineups(result["lineups"])
-
         hint_count = len(cleaned_stats.get("narrative_hints", []))
         confirmed = cleaned_lineups.get("confirmed", False)
         print(f"      Stats OK. Hints: {hint_count} | Lineups confirmed: {confirmed}")
@@ -290,14 +281,8 @@ def step_fetch_sofascore_data(raw_match: dict) -> dict:
 
 def step_fetch_incidents(sofascore_data: dict, home_team: str,
                          away_team: str) -> dict:
-    """
-    Clean match incidents (goals, cards, subs) from raw SofaScore data.
-
-    Returns:
-        Cleaned incidents dict, or empty dict if unavailable.
-    """
+    """Clean match incidents (goals, cards, subs) from SofaScore data."""
     raw_incidents = sofascore_data.get("raw_incidents", {})
-
     if not raw_incidents:
         return {}
 
@@ -315,12 +300,7 @@ def step_fetch_incidents(sofascore_data: dict, home_team: str,
 
 def step_summarize(raw_match: dict, competition_name: str,
                    sofascore_data: dict, incidents: dict) -> str:
-    """
-    Build full match context and generate AI summary via Groq.
-
-    Returns:
-        Summary text string with four ## sections.
-    """
+    """Build match context and generate AI summary via Groq."""
     match_data = {
         "home_team": raw_match.get("homeTeam", {}).get("name", "Unknown"),
         "away_team": raw_match.get("awayTeam", {}).get("name", "Unknown"),
@@ -350,14 +330,12 @@ def step_summarize(raw_match: dict, competition_name: str,
             "events_text": incidents.get("events_text", ""),
         }
 
-    summary = summarize_match(context)
-    return summary
+    return summarize_match(context)
 
 
 def step_save(match_id: int, summary: str, incidents: dict):
     """Persist AI summary and match events to DB."""
     save_summary(match_id, summary)
-
     if incidents:
         saved_events = save_match_events(match_id, incidents)
         print(f"      Saved {saved_events} event(s) to DB.")
@@ -368,34 +346,48 @@ def step_save(match_id: int, summary: str, incidents: dict):
 # -------------------------------------------------------------------------
 
 def run_pipeline(
-    competition_code: str = TARGET_COMPETITION_CODE,
-    competition_id: int = TARGET_COMPETITION_ID,
-    competition_name: str = TARGET_COMPETITION_NAME,
+    competition_code: str = DEFAULT_COMPETITION,
+    competition_id: int = None,
+    competition_name: str = None,
     target_matchday: int | None = None,
 ) -> list:
     """
-    Runs the full ETL + summarization pipeline.
+    Runs the full ETL + summarization pipeline for a competition.
 
-    In auto mode (target_matchday=None), processes all unanalysed matches
-    from the most complete finished matchday — used by the frontend button.
+    If competition_id or competition_name are None, they are looked up
+    from the COMPETITIONS registry using competition_code. This means
+    callers only need to pass competition_code — the rest is automatic.
 
-    In backfill mode (target_matchday=N), processes a specific matchday —
-    used from the CLI for catching up on historical data.
+    The frontend POST /api/pipeline/run calls this with no arguments,
+    which defaults to Premier League auto mode — unchanged behaviour.
 
     Args:
-        competition_code:  e.g. "PL"
-        competition_id:    e.g. 2021
-        competition_name:  e.g. "Premier League"
-        target_matchday:   Specific matchday to process, or None for auto.
+        competition_code:  e.g. "PL", "CL", "PD" — see COMPETITIONS dict
+        competition_id:    numeric DB id — looked up if None
+        competition_name:  human name for AI prompt — looked up if None
+        target_matchday:   specific matchday to process, or None for auto
 
     Returns:
         List of result dicts — one per match attempted.
-        Each has: match_id, home_team, away_team, status ("ok"/"error").
     """
+    # Look up competition metadata if not provided directly
+    if competition_code not in COMPETITIONS:
+        raise ValueError(
+            f"Unknown competition code: {competition_code}. "
+            f"Supported: {', '.join(COMPETITIONS.keys())}"
+        )
+    comp_meta = COMPETITIONS[competition_code]
+    if competition_id is None:
+        competition_id = comp_meta["id"]
+    if competition_name is None:
+        competition_name = comp_meta["name"]
+
     start = datetime.now()
     mode = f"BACKFILL MD{target_matchday}" if target_matchday else "AUTO"
     print("=" * 55)
-    print(f"  FOOTBALL ANALYTICS PIPELINE — V2 [{mode}]")
+    print(f"  FOOTBALL ANALYTICS PIPELINE — V2")
+    print(f"  Competition: {competition_name} ({competition_code})")
+    print(f"  Mode: {mode}")
     print(f"  Started: {start.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 55 + "\n")
 
@@ -428,15 +420,12 @@ def run_pipeline(
         try:
             sofascore_data = step_fetch_sofascore_data(raw_match)
             incidents = step_fetch_incidents(sofascore_data, home, away)
-
             print(f"      Generating AI summary...")
             summary = step_summarize(
                 raw_match, competition_name, sofascore_data, incidents
             )
-
             step_save(match_id, summary, incidents)
             print(f"      ✓ Done.\n")
-
             results.append({
                 "match_id": match_id,
                 "home_team": home,
@@ -454,8 +443,6 @@ def run_pipeline(
                 "error": str(e),
             })
 
-        # Respect Groq rate limits between calls.
-        # Skip delay after the last match — no next call to protect.
         if i < total:
             print(f"      Waiting {GROQ_DELAY_SECONDS}s before next match...")
             time.sleep(GROQ_DELAY_SECONDS)
@@ -465,7 +452,7 @@ def run_pipeline(
     fail_count = len(results) - ok_count
 
     print("=" * 55)
-    print(f"  PIPELINE COMPLETE [{mode}]")
+    print(f"  PIPELINE COMPLETE — {competition_name}")
     print(f"  Analysed: {ok_count} match(es)")
     if fail_count:
         print(f"  Failed:   {fail_count} match(es)")
@@ -480,29 +467,38 @@ def run_pipeline(
 # -------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    """
-    CLI usage:
-        python -m backend.main                  # auto mode
-        python -m backend.main --matchday 28    # backfill MD28
-
-    argparse is Python's standard library for parsing command-line
-    arguments. add_argument() defines what flags are accepted.
-    parse_args() reads sys.argv (the actual command you typed) and
-    returns a Namespace object where args.matchday is the value.
-
-    type=int tells argparse to convert the string "28" to the integer 28
-    automatically — otherwise everything from the terminal is a string.
-    """
     parser = argparse.ArgumentParser(
-        description="Football Analytics Pipeline"
+        description="Football Analytics Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python -m backend.main                          # PL, auto matchday
+  python -m backend.main --competition CL         # Champions League, auto
+  python -m backend.main --competition PD         # La Liga, auto
+  python -m backend.main --competition BL1        # Bundesliga, auto
+  python -m backend.main --competition SA         # Serie A, auto
+  python -m backend.main --competition CL --matchday 6   # CL backfill MD6
+  python -m backend.main --matchday 24            # PL backfill MD24
+
+Supported competition codes: PL, CL, PD, BL1, SA, FL1
+        """
+    )
+    parser.add_argument(
+        "--competition",
+        type=str,
+        default=DEFAULT_COMPETITION,
+        choices=list(COMPETITIONS.keys()),
+        help="Competition code (default: PL)"
     )
     parser.add_argument(
         "--matchday",
         type=int,
         default=None,
-        help="Specific matchday to process (e.g. --matchday 28). "
-             "Omit for auto-detection of most complete matchday."
+        help="Specific matchday to process (default: auto-detect most complete)"
     )
     args = parser.parse_args()
 
-    run_pipeline(target_matchday=args.matchday)
+    run_pipeline(
+        competition_code=args.competition,
+        target_matchday=args.matchday,
+    )
