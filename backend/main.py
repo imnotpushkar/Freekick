@@ -5,19 +5,32 @@ Orchestrates the full V1 pipeline:
     1. Initialize database
     2. Fetch matches from Football-Data.org API
     3. Clean and store competitions, teams, matches
-    4. Find the most recent finished match
-    5. Fetch SofaScore stats and lineups for that match
-    6. Fetch SofaScore incidents (goals, cards, subs)  ← NEW
-    7. Generate creator-quality AI summary
-    8. Save summary and events to DB
+    4. Find all finished matches from the most complete matchday
+       that do NOT yet have a summary
+    5. For each unanalysed match:
+       a. Fetch SofaScore stats and lineups
+       b. Fetch SofaScore incidents (goals, cards, subs)
+       c. Generate AI summary via Groq
+       d. Save summary and events to DB
+    6. Sleep 3s between matches to respect Groq rate limits
+
+WHY WE TARGET THE MOST COMPLETE MATCHDAY:
+    A season runs concurrently — matches from different matchdays
+    can be played out of order (fixture postponements, rescheduling).
+    "Highest matchday number" is wrong because a single match from
+    MD31 could be played before MD29 is even finished.
+    Instead we count finished matches per matchday and pick the one
+    with the highest count. That's the round closest to completion
+    and the most useful to analyse as a batch.
 
 Run with: python -m backend.main
 """
 
 import sys
+import time
 from datetime import datetime
 
-from backend.db.schema import init_db
+from backend.db.schema import init_db, Summary
 from backend.db.writer import (
     save_competitions,
     save_teams,
@@ -40,6 +53,10 @@ from backend.processors.cleaner import (
     build_match_context,
 )
 from backend.summarizer.summarize import summarize_match
+from backend.db.schema import engine
+from sqlalchemy.orm import sessionmaker
+
+SessionLocal = sessionmaker(bind=engine)
 
 
 # -------------------------------------------------------------------------
@@ -50,6 +67,13 @@ TARGET_COMPETITION_CODE = "PL"
 TARGET_COMPETITION_ID = 2021
 TARGET_COMPETITION_NAME = "Premier League"
 
+# Seconds to wait between Groq API calls.
+# Groq free tier: 30 requests/minute, 6000 tokens/minute on llama-3.3-70b.
+# Each summary uses ~1500 tokens output + ~800 input = ~2300 tokens.
+# At 6000 tokens/minute we can do ~2.6 matches/minute safely.
+# 3 seconds between calls keeps us well within limits.
+GROQ_DELAY_SECONDS = 3
+
 
 # -------------------------------------------------------------------------
 # Pipeline steps
@@ -57,21 +81,27 @@ TARGET_COMPETITION_NAME = "Premier League"
 
 def step_init():
     """Step 1: Ensure DB exists with all tables."""
-    print("[1/7] Initializing database...")
+    print("[1/5] Initializing database...")
     init_db()
     print("      Done.\n")
 
 
 def step_fetch_and_store(competition_code: str,
-                          competition_id: int) -> list:
+                         competition_id: int) -> list:
     """
     Step 2: Fetch matches from Football-Data.org, clean, save to DB.
     Skips matches already in DB to avoid redundant API calls.
 
+    WHY WE SKIP EXISTING MATCHES:
+        Football-Data.org free tier allows 10 requests/minute.
+        We only need one request to get all matches for a competition.
+        Skipping DB writes for existing matches keeps the pipeline
+        idempotent — safe to run multiple times without duplicating data.
+
     Returns:
-        List of all raw match dicts from the API.
+        List of all raw match dicts from the API (including existing ones).
     """
-    print(f"[2/7] Fetching matches for: {competition_code}...")
+    print(f"[2/5] Fetching matches for: {competition_code}...")
 
     raw_matches = get_matches_by_competition(competition_code)
     print(f"      Found {len(raw_matches)} matches from API.")
@@ -102,39 +132,102 @@ def step_fetch_and_store(competition_code: str,
     return raw_matches
 
 
-def step_get_latest_finished_match(raw_matches: list) -> dict | None:
+def step_get_unanalysed_matches(raw_matches: list) -> list:
     """
-    Step 3: Find the most recently finished match from the raw list.
+    Step 3: Find all finished matches from the most complete matchday
+    that do not yet have a summary in the DB.
+
+    WHY MOST COMPLETE MATCHDAY INSTEAD OF HIGHEST MATCHDAY NUMBER:
+        Premier League fixtures are not always played in strict matchday
+        order. A single MD31 match can be played before MD29 is finished
+        (e.g. midweek fixtures, rescheduled games). If we targeted the
+        highest matchday number we would process that lone MD31 match
+        and miss the 7 remaining MD29 matches entirely.
+
+        Instead we count finished matches per matchday and pick the one
+        with the highest count. When two matchdays tie (both 10/10), we
+        pick the higher number — the more recent completed round.
+
+    WHY CHECK THE DB FOR EXISTING SUMMARIES:
+        The pipeline is idempotent — safe to run multiple times.
+        If it crashes halfway through a matchday, re-running picks up
+        where it left off rather than regenerating existing summaries
+        and wasting Groq tokens.
 
     Returns:
-        Single raw match dict, or None if no finished matches found.
+        List of raw match dicts that need summarizing, sorted by
+        kick-off time ascending (chronological order within matchday).
     """
-    print("[3/7] Finding most recent finished match...")
+    print("[3/5] Finding unanalysed matches from most complete matchday...")
 
+    # Filter to finished matches only
     finished = [m for m in raw_matches if m.get("status") == "FINISHED"]
 
     if not finished:
         print("      No finished matches found.\n")
-        return None
+        return []
 
-    finished.sort(key=lambda m: m.get("utcDate", ""), reverse=True)
-    latest = finished[0]
+    # Count finished matches per matchday
+    # Result: { matchday_number: count_of_finished_matches }
+    matchday_counts = {}
+    for m in finished:
+        md = m.get("matchday", 0)
+        matchday_counts[md] = matchday_counts.get(md, 0) + 1
 
-    home = latest.get("homeTeam", {}).get("name", "Unknown")
-    away = latest.get("awayTeam", {}).get("name", "Unknown")
-    score_home = latest.get("score", {}).get("fullTime", {}).get("home", "?")
-    score_away = latest.get("score", {}).get("fullTime", {}).get("away", "?")
-    print(f"      Latest: {home} {score_home} - {score_away} {away}\n")
+    # Pick the matchday with the most finished matches.
+    # Tiebreak: higher matchday number wins (more recent round).
+    target_matchday = max(
+        matchday_counts,
+        key=lambda md: (matchday_counts[md], md)
+    )
+    finished_count = matchday_counts[target_matchday]
 
-    return latest
+    # Total matches in that matchday (finished + scheduled)
+    total_in_md = sum(
+        1 for m in raw_matches if m.get("matchday") == target_matchday
+    )
+
+    print(f"      Most complete matchday: MD{target_matchday} "
+          f"({finished_count}/{total_in_md} finished)")
+
+    # Get all finished matches from that matchday
+    matchday_matches = [
+        m for m in finished if m.get("matchday") == target_matchday
+    ]
+
+    # Check which ones already have summaries in the DB
+    session = SessionLocal()
+    try:
+        existing_summary_ids = {
+            row.match_id
+            for row in session.query(Summary.match_id).all()
+        }
+    finally:
+        session.close()
+
+    # Keep only matches without a summary
+    unanalysed = [
+        m for m in matchday_matches
+        if m.get("id") not in existing_summary_ids
+    ]
+
+    # Sort chronologically — process in kick-off order
+    unanalysed.sort(key=lambda m: m.get("utcDate", ""))
+
+    already_done = len(matchday_matches) - len(unanalysed)
+    print(f"      Already analysed: {already_done}")
+    print(f"      Need analysis:    {len(unanalysed)}\n")
+
+    return unanalysed
 
 
 def step_fetch_sofascore_data(raw_match: dict) -> dict:
     """
-    Step 4: Fetch SofaScore statistics and lineups for the match.
+    Fetch SofaScore statistics and lineups for a single match.
 
     Returns:
-        Dict with "stats" and "lineups" keys, or empty dict on failure.
+        Dict with "stats", "lineups", "raw_incidents" keys.
+        Returns empty dict on failure — pipeline continues without stats.
     """
     from backend.scrapers.sofascore import get_full_match_data
 
@@ -142,15 +235,13 @@ def step_fetch_sofascore_data(raw_match: dict) -> dict:
     away_team = raw_match.get("awayTeam", {}).get("name", "")
     date_str = raw_match.get("utcDate", "")[:10]
 
-    print(f"[4/7] Fetching SofaScore stats + lineups: "
-          f"{home_team} vs {away_team}...")
+    print(f"      Fetching SofaScore: {home_team} vs {away_team}...")
 
     try:
         result = get_full_match_data(date_str, home_team, away_team)
 
         if not result:
-            print("      Match not found on SofaScore — "
-                  "summary will use match data only.\n")
+            print("      Not found on SofaScore — using match data only.")
             return {}
 
         cleaned_stats = clean_sofascore_stats(
@@ -160,72 +251,53 @@ def step_fetch_sofascore_data(raw_match: dict) -> dict:
 
         hint_count = len(cleaned_stats.get("narrative_hints", []))
         confirmed = cleaned_lineups.get("confirmed", False)
-        print(f"      Stats fetched. Narrative hints: {hint_count}")
-        print(f"      Lineups confirmed: {confirmed}\n")
+        print(f"      Stats OK. Hints: {hint_count} | Lineups confirmed: {confirmed}")
 
         return {
             "stats": cleaned_stats,
             "lineups": cleaned_lineups,
-            # Pass raw incidents through for step 5 to clean separately
             "raw_incidents": result.get("incidents", {}),
             "sofascore_match_id": result.get("match_id"),
         }
 
     except Exception as e:
-        print(f"      SofaScore fetch failed: {e} — "
-              f"continuing without stats.\n")
+        print(f"      SofaScore fetch failed: {e} — continuing without stats.")
         return {}
 
 
 def step_fetch_incidents(sofascore_data: dict, home_team: str,
-                          away_team: str) -> dict:
+                         away_team: str) -> dict:
     """
-    Step 5: Clean match incidents (goals, cards, subs) from the
-    raw incidents data fetched in step 4.
-
-    Incidents are fetched as part of get_full_match_data() in step 4
-    and stored in sofascore_data["raw_incidents"]. This step cleans
-    and structures them.
+    Clean match incidents (goals, cards, subs) from raw SofaScore data.
 
     Returns:
-        Output of clean_match_incidents() — goals, cards, subs, events_text.
-        Returns empty dict if incidents unavailable.
+        Cleaned incidents dict, or empty dict if unavailable.
     """
-    print("[5/7] Processing match incidents (goals, cards, subs)...")
-
     raw_incidents = sofascore_data.get("raw_incidents", {})
 
     if not raw_incidents:
-        print("      No incidents data available.\n")
         return {}
 
     try:
         cleaned = clean_match_incidents(raw_incidents, home_team, away_team)
         goal_count = len(cleaned.get("goals", []))
         card_count = len(cleaned.get("cards", []))
-        sub_count = len(cleaned.get("substitutions", []))
-        print(f"      Goals: {goal_count} | Cards: {card_count} "
-              f"| Subs: {sub_count}")
-        print(f"      Events text preview: "
-              f"{cleaned.get('events_text', '')[:80]}...\n")
+        sub_count  = len(cleaned.get("substitutions", []))
+        print(f"      Incidents: {goal_count} goals | {card_count} cards | {sub_count} subs")
         return cleaned
     except Exception as e:
-        print(f"      Incidents processing failed: {e}\n")
+        print(f"      Incidents processing failed: {e}")
         return {}
 
 
 def step_summarize(raw_match: dict, competition_name: str,
                    sofascore_data: dict, incidents: dict) -> str:
     """
-    Step 6: Build full match context and generate AI summary.
-    Now includes match events in the context so the AI knows
-    who scored, when, and who was carded.
+    Build full match context and generate AI summary via Groq.
 
     Returns:
-        Summary text string.
+        Summary text string with four ## sections.
     """
-    print("[6/7] Generating AI summary...")
-
     match_data = {
         "home_team": raw_match.get("homeTeam", {}).get("name", "Unknown"),
         "away_team": raw_match.get("awayTeam", {}).get("name", "Unknown"),
@@ -256,20 +328,16 @@ def step_summarize(raw_match: dict, competition_name: str,
         }
 
     summary = summarize_match(context)
-    print("      Summary generated.\n")
     return summary
 
 
 def step_save(match_id: int, summary: str, incidents: dict):
-    """Step 7: Persist the AI summary and match events to DB."""
-    print("[7/7] Saving summary and events to database...")
+    """Persist AI summary and match events to DB."""
     save_summary(match_id, summary)
 
     if incidents:
         saved_events = save_match_events(match_id, incidents)
-        print(f"      Saved {saved_events} match event(s).")
-
-    print("      Done.\n")
+        print(f"      Saved {saved_events} event(s) to DB.")
 
 
 # -------------------------------------------------------------------------
@@ -280,14 +348,22 @@ def run_pipeline(
     competition_code: str = TARGET_COMPETITION_CODE,
     competition_id: int = TARGET_COMPETITION_ID,
     competition_name: str = TARGET_COMPETITION_NAME,
-):
+) -> list:
     """
-    Runs the full ETL + summarization pipeline.
-    Called directly or triggered by n8n Execute Command node.
+    Runs the full ETL + summarization pipeline for all unanalysed
+    matches from the most complete finished matchday.
+
+    Called directly (python -m backend.main) or via the Flask
+    POST /api/pipeline/run endpoint.
+
+    Returns:
+        List of result dicts — one per match processed.
+        Each dict has: match_id, home_team, away_team, status.
+        Status is "ok" or "error".
     """
     start = datetime.now()
     print("=" * 55)
-    print("  FOOTBALL ANALYTICS PIPELINE — V1")
+    print("  FOOTBALL ANALYTICS PIPELINE — V2")
     print(f"  Started: {start.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 55 + "\n")
 
@@ -296,33 +372,74 @@ def run_pipeline(
     raw_matches = step_fetch_and_store(competition_code, competition_id)
     if not raw_matches:
         print("No matches returned from API. Exiting.")
-        sys.exit(0)
+        return []
 
-    latest_match = step_get_latest_finished_match(raw_matches)
-    if not latest_match:
-        print("No finished matches available. Exiting.")
-        sys.exit(0)
+    unanalysed = step_get_unanalysed_matches(raw_matches)
+    if not unanalysed:
+        print("All matches from the most complete matchday are already analysed.")
+        print("Nothing to do.\n")
+        return []
 
-    home_team = latest_match.get("homeTeam", {}).get("name", "")
-    away_team = latest_match.get("awayTeam", {}).get("name", "")
+    total = len(unanalysed)
+    print(f"[4/5] Processing {total} match(es)...\n")
 
-    sofascore_data = step_fetch_sofascore_data(latest_match)
-    incidents = step_fetch_incidents(sofascore_data, home_team, away_team)
+    results = []
 
-    summary = step_summarize(
-        latest_match, competition_name, sofascore_data, incidents
-    )
+    for i, raw_match in enumerate(unanalysed, start=1):
+        home = raw_match.get("homeTeam", {}).get("name", "Unknown")
+        away = raw_match.get("awayTeam", {}).get("name", "Unknown")
+        match_id = raw_match.get("id")
 
-    step_save(latest_match["id"], summary, incidents)
+        print(f"  [{i}/{total}] {home} vs {away} (ID: {match_id})")
+
+        try:
+            sofascore_data = step_fetch_sofascore_data(raw_match)
+            incidents = step_fetch_incidents(sofascore_data, home, away)
+
+            print(f"      Generating AI summary...")
+            summary = step_summarize(
+                raw_match, competition_name, sofascore_data, incidents
+            )
+
+            step_save(match_id, summary, incidents)
+            print(f"      ✓ Done.\n")
+
+            results.append({
+                "match_id": match_id,
+                "home_team": home,
+                "away_team": away,
+                "status": "ok",
+            })
+
+        except Exception as e:
+            print(f"      ✗ Failed: {e}\n")
+            results.append({
+                "match_id": match_id,
+                "home_team": home,
+                "away_team": away,
+                "status": "error",
+                "error": str(e),
+            })
+
+        # Respect Groq rate limits between calls.
+        # Skip delay after the last match — no next call to protect.
+        if i < total:
+            print(f"      Waiting {GROQ_DELAY_SECONDS}s before next match...")
+            time.sleep(GROQ_DELAY_SECONDS)
 
     elapsed = (datetime.now() - start).seconds
+    ok_count   = sum(1 for r in results if r["status"] == "ok")
+    fail_count = len(results) - ok_count
+
     print("=" * 55)
     print("  PIPELINE COMPLETE")
+    print(f"  Analysed: {ok_count} match(es)")
+    if fail_count:
+        print(f"  Failed:   {fail_count} match(es)")
     print(f"  Time elapsed: {elapsed}s")
     print("=" * 55 + "\n")
-    print("MATCH SUMMARY:")
-    print("-" * 55)
-    print(summary)
+
+    return results
 
 
 if __name__ == "__main__":

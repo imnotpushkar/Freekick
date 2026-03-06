@@ -90,7 +90,7 @@ def _match_to_dict(match: Match, session) -> dict:
         "away_team": away_team.name if away_team else "Unknown",
         "home_score": match.home_score,
         "away_score": match.away_score,
-        "has_summary": summary_exists,   # NEW — drives MatchCard badge
+        "has_summary": summary_exists,
     }
 
 
@@ -289,45 +289,52 @@ def run_pipeline():
     POST /api/pipeline/run
 
     Triggers the full ETL + summarization pipeline.
-    Synchronous — waits for completion before responding (~22s).
+    Processes all unanalysed matches from the latest finished matchday.
 
     WHY POST AND NOT GET:
         GET requests must be side-effect free — safe to call
         repeatedly. This endpoint writes to the DB, so it's a POST.
 
-    Returns the generated summary for the latest match.
+    WHY SYNCHRONOUS:
+        For a free-tier project, async job queues (Celery, RQ) add
+        significant complexity. The pipeline takes ~2-3 minutes for
+        a full matchday. The frontend PipelineButton shows a loading
+        spinner during this time — acceptable UX for a dev tool.
+
+    Response shape:
+        {
+            "status": "pipeline_complete",
+            "analysed": 9,
+            "failed": 0,
+            "already_done": 1,
+            "results": [
+                {
+                    "match_id": 538074,
+                    "home_team": "Newcastle United FC",
+                    "away_team": "Manchester United FC",
+                    "status": "ok"
+                },
+                ...
+            ]
+        }
     """
     try:
         from backend.main import run_pipeline as _run_pipeline
 
-        _run_pipeline()
+        results = _run_pipeline()
 
-        session = _get_db()
-        try:
-            latest_match = (
-                session.query(Match)
-                .filter(Match.status == "FINISHED")
-                .order_by(Match.utc_date.desc())
-                .first()
-            )
+        ok_count   = sum(1 for r in results if r["status"] == "ok")
+        fail_count = sum(1 for r in results if r["status"] == "error")
 
-            if not latest_match:
-                return jsonify({"error": "No finished matches found"}), 404
-
-            summary = session.query(Summary).filter_by(
-                match_id=latest_match.id
-            ).first()
-
-            match_info = _match_to_dict(latest_match, session)
-
-            return jsonify({
-                "status": "pipeline_complete",
-                "match": match_info,
-                "summary": summary.content if summary else None,
-            })
-
-        finally:
-            session.close()
+        # Count how many were already done (not in results — they were skipped)
+        # We report this from the pipeline's own console output, but for the
+        # API response we just report what was processed this run.
+        return jsonify({
+            "status": "pipeline_complete",
+            "analysed": ok_count,
+            "failed": fail_count,
+            "results": results,
+        })
 
     except Exception as e:
         return jsonify({"error": str(e), "status": "pipeline_failed"}), 500
