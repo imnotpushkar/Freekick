@@ -9,6 +9,7 @@ const SERIE_A = {
   code:  'SA',
   name:  'Serie A',
   label: 'SERIE A',
+  path: '/serie-a'
 }
 
 export default function SerieAPage() {

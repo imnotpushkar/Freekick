@@ -9,6 +9,7 @@ const LA_LIGA = {
   code:  'PD',
   name:  'La Liga',
   label: 'LA LIGA',
+  path: '/la-liga'
 }
 
 export default function LaLigaPage() {

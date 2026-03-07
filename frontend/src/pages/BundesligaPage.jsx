@@ -9,6 +9,7 @@ const BUNDESLIGA = {
   code:  'BL1',
   name:  'Bundesliga',
   label: 'BUNDESLIGA',
+  path: '/bundesliga'
 }
 
 export default function BundesligaPage() {

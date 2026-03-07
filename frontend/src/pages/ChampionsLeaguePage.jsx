@@ -10,6 +10,7 @@ const CHAMPIONS_LEAGUE = {
   code:  'CL',
   name:  'UEFA Champions League',
   label: 'CHAMPIONS LEAGUE',
+  path: '/champions-league'
 }
 
 export default function ChampionsLeaguePage() {
