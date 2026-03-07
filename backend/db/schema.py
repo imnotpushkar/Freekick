@@ -5,13 +5,26 @@ Defines the database schema using SQLAlchemy ORM.
 Creates the SQLite database file at data/football.db if it doesn't exist.
 
 Tables:
-    - competitions: stores league/cup info
-    - teams: stores team info
-    - matches: stores match results linked to competitions and teams
-    - players: stores player info linked to a team
-    - player_stats: stores per-match stats for each player
-    - match_events: stores goals, cards, substitutions per match  ← NEW
-    - summaries: stores AI-generated summaries linked to a match
+    - competitions:  league/cup info
+    - teams:         team info
+    - matches:       match results linked to competitions and teams
+    - players:       player info linked to a team
+    - player_stats:  per-match stats per player (reserved for future player-level data)
+    - match_stats:   per-match team-level stats (possession, xG, shots, etc.)  ← NEW
+    - match_events:  goals, cards, substitutions per match
+    - summaries:     AI-generated summaries linked to a match
+
+DESIGN NOTE — match_stats vs player_stats:
+    player_stats stores one row PER PLAYER per match.
+    match_stats stores one row PER TEAM per match (two rows total per match).
+
+    Possession, xG, shots, tackles etc. come from SofaScore's
+    /match/statistics endpoint, which returns team-level aggregates —
+    not broken down by player. Storing them in player_stats would mean
+    duplicating the same team value across 11 player rows and then
+    averaging it back out, which is architecturally wrong.
+
+    match_stats is the correct home for team-level stats from SofaScore.
 """
 
 from sqlalchemy import (
@@ -32,12 +45,11 @@ import os
 # -------------------------------------------------------------------------
 # Engine setup
 # -------------------------------------------------------------------------
-# create_engine() is SQLAlchemy's way of connecting to a database.
-# The string "sqlite:///..." is a connection URL.
-# Three slashes = relative path. We point it to data/football.db
-# echo=False means SQLAlchemy won't print every SQL statement it runs.
-# We build the path dynamically so it works regardless of where the script
-# is called from.
+# create_engine() connects SQLAlchemy to a database.
+# "sqlite:///..." is the connection URL — three slashes = relative path.
+# We build the path dynamically using __file__ so it works regardless
+# of which directory the script is called from.
+# echo=False: SQLAlchemy won't print every SQL statement it executes.
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DB_PATH = os.path.join(BASE_DIR, "data", "football.db")
@@ -48,8 +60,8 @@ engine = create_engine(DB_URL, echo=False)
 # -------------------------------------------------------------------------
 # Base class
 # -------------------------------------------------------------------------
-# declarative_base() returns a base class that all our table models will
-# inherit from. SQLAlchemy uses this to track all defined tables.
+# declarative_base() returns a class that all table models inherit from.
+# SQLAlchemy uses this registry to know which classes represent tables.
 
 Base = declarative_base()
 
@@ -61,7 +73,6 @@ Base = declarative_base()
 class Competition(Base):
     """
     Represents a football competition (e.g. Premier League, Champions League).
-    Football-Data.org uses competition IDs — we store them here.
     """
     __tablename__ = "competitions"
 
@@ -96,7 +107,7 @@ class Team(Base):
 class Match(Base):
     """
     Represents a single football match.
-    Links to Competition, and to two Teams (home and away).
+    Links to Competition and to two Teams (home and away).
     """
     __tablename__ = "matches"
 
@@ -115,6 +126,7 @@ class Match(Base):
     home_team = relationship("Team", foreign_keys=[home_team_id])
     away_team = relationship("Team", foreign_keys=[away_team_id])
     player_stats = relationship("PlayerStat", back_populates="match")
+    match_stats = relationship("MatchStat", back_populates="match")
     match_events = relationship("MatchEvent", back_populates="match")
     summary = relationship("Summary", back_populates="match", uselist=False)
 
@@ -144,7 +156,8 @@ class Player(Base):
 class PlayerStat(Base):
     """
     Per-match statistics for a single player.
-    Advanced stats (xG, passes) populated when per-player API available.
+    Reserved for future player-level data sources.
+    Currently unpopulated — team-level stats live in MatchStat.
     """
     __tablename__ = "player_stats"
 
@@ -158,7 +171,6 @@ class PlayerStat(Base):
     minutes_played = Column(Integer, default=0)
     yellow_cards = Column(Integer, default=0)
     red_cards = Column(Integer, default=0)
-
     shots = Column(Integer, default=0)
     shots_on_target = Column(Integer, default=0)
     xg = Column(Float, default=0.0)
@@ -174,45 +186,101 @@ class PlayerStat(Base):
         return f"<PlayerStat player={self.player_id} match={self.match_id}>"
 
 
+class MatchStat(Base):
+    """
+    Team-level statistics for one side in a match.
+    Two rows per match — one for home team, one for away team.
+
+    All values sourced from SofaScore /match/statistics endpoint.
+    Populated by the pipeline when SofaScore data is available.
+
+    WHY TWO ROWS PER MATCH (not one row with home_ and away_ columns):
+        Two rows per match follows the same pattern as MatchEvent —
+        each row belongs to one team (identified by team_id + is_home).
+        This makes it easy to query "all stats for team X across all
+        matches" without needing to union home and away columns.
+        It also means adding a new stat column adds it once, not twice.
+
+    COLUMN NAMING:
+        Names match the keys in clean_sofascore_stats() output exactly
+        (home/away sub-dicts) so writer.py can pass them directly
+        without a remapping step.
+    """
+    __tablename__ = "match_stats"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+    is_home = Column(Boolean, nullable=False)
+
+    # Possession and chance quality
+    possession = Column(Float)            # ball possession % e.g. 62.0
+    xg = Column(Float)                    # expected goals e.g. 3.18
+    big_chances = Column(Integer)         # clear-cut chances
+
+    # Shots
+    total_shots = Column(Integer)
+    shots_on_target = Column(Integer)
+    shots_off_target = Column(Integer)
+    shots_inside_box = Column(Integer)
+
+    # Passing
+    passes = Column(Integer)              # total passes attempted
+    accurate_passes = Column(Integer)     # passes completed
+    pass_accuracy = Column(Float)         # computed: accurate/total * 100
+
+    # Defensive
+    tackles = Column(Integer)
+    interceptions = Column(Integer)
+    recoveries = Column(Integer)          # total ball recoveries (pressing indicator)
+    clearances = Column(Integer)
+    fouls = Column(Integer)
+
+    # Attacking movement
+    final_third_entries = Column(Integer)
+    long_balls = Column(String(20))       # stored as display string e.g. "34/67"
+    crosses = Column(String(20))          # stored as display string e.g. "3/8"
+
+    # Goalkeeper
+    goalkeeper_saves = Column(Integer)
+    goals_prevented = Column(Float)       # xG prevented by GK
+
+    match = relationship("Match", back_populates="match_stats")
+
+    def __repr__(self):
+        side = "Home" if self.is_home else "Away"
+        return f"<MatchStat {side} match={self.match_id} xg={self.xg}>"
+
+
 class MatchEvent(Base):
     """
     Stores individual match events — goals, cards, substitutions.
-    Populated from SofaScore incidents endpoint (API Dojo host).
-
-    One row per event. Multiple rows per match.
-
-    event_type values: "goal", "card", "substitution"
 
     For goals:
-        player_name = scorer
-        secondary_player_name = assist (nullable)
+        player_name = scorer, secondary_player_name = assist (nullable)
         detail = "regular", "penalty", or "own-goal"
 
     For cards:
-        player_name = player carded
-        secondary_player_name = None
+        player_name = player carded, secondary_player_name = None
         detail = "yellow", "yellow-red", or "red"
         reason = foul reason string (nullable)
 
     For substitutions:
         player_name = player coming OFF
         secondary_player_name = player coming ON
-        detail = "injury" if injury sub, else "tactical"
-
-    is_home: True if the event belongs to the home team.
-    Used to label events with team names when querying.
+        detail = "injury" or "tactical"
     """
     __tablename__ = "match_events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
-    event_type = Column(String(20), nullable=False)   # "goal", "card", "substitution"
+    event_type = Column(String(20), nullable=False)
     minute = Column(Integer, nullable=False)
     is_home = Column(Boolean, nullable=False)
-    player_name = Column(String(100))                 # scorer / carded player / player off
-    secondary_player_name = Column(String(100))       # assist / player on
-    detail = Column(String(50))                       # goal type / card colour / sub reason
-    reason = Column(String(100))                      # card reason (nullable)
+    player_name = Column(String(100))
+    secondary_player_name = Column(String(100))
+    detail = Column(String(50))
+    reason = Column(String(100))
 
     match = relationship("Match", back_populates="match_events")
 
@@ -247,14 +315,17 @@ class Summary(Base):
 
 def init_db():
     """
-    Creates all tables in the database if they don't already exist.
-    Safe to call multiple times — won't overwrite existing data.
+    Creates all tables that don't already exist.
+    Safe to call multiple times — won't touch existing tables or data.
 
-    Note on schema changes: SQLite's create_all() only creates NEW tables.
-    It does NOT alter existing tables to add new columns.
-    If match_events table already exists from a previous run and the schema
-    changed, you need to delete data/football.db and let it recreate.
-    This is acceptable in pre-production (v0.x).
+    IMPORTANT — SQLite migration limitation:
+        create_all() creates NEW tables only. It does NOT alter existing
+        tables to add columns. If you add a column to an existing model,
+        you must either:
+          a) Delete data/football.db and let it recreate (dev only), or
+          b) Use a migration tool like Alembic (production standard).
+        Adding a NEW table (like match_stats) is always safe — create_all()
+        will create it without touching any existing tables.
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     Base.metadata.create_all(engine)

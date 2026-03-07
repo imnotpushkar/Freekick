@@ -19,6 +19,7 @@ from backend.db.schema import (
     Match,
     Player,
     PlayerStat,
+    MatchStat,
     MatchEvent,
     Summary,
 )
@@ -29,15 +30,18 @@ SessionLocal = sessionmaker(bind=engine)
 @contextmanager
 def get_session():
     """
-    Provides a transactional database session.
+    Provides a transactional database session as a context manager.
     Commits on success, rolls back on any exception, always closes.
 
-    Used as a context manager:
+    WHY A CONTEXT MANAGER:
+        The 'with' statement guarantees cleanup even if an exception
+        is raised mid-function. Without this pattern you'd need
+        try/except/finally in every function that touches the DB.
+        contextmanager lets us write that cleanup logic once here.
+
+    Usage:
         with get_session() as session:
             session.merge(some_object)
-
-    The context manager pattern guarantees the session is always closed
-    even if an exception is raised — prevents connection leaks.
     """
     session = SessionLocal()
     try:
@@ -54,12 +58,6 @@ def save_competitions(competitions: list) -> int:
     """
     Saves a list of clean competition dicts to the DB.
     Uses merge() so existing competitions are updated, not duplicated.
-
-    Args:
-        competitions: List of clean dicts from clean_competitions()
-
-    Returns:
-        Count of competitions saved.
     """
     with get_session() as session:
         for comp_data in competitions:
@@ -69,15 +67,7 @@ def save_competitions(competitions: list) -> int:
 
 
 def save_teams(teams: list) -> int:
-    """
-    Saves a list of clean team dicts to the DB.
-
-    Args:
-        teams: List of clean dicts from clean_teams_from_matches()
-
-    Returns:
-        Count of teams saved.
-    """
+    """Saves a list of clean team dicts to the DB."""
     with get_session() as session:
         for team_data in teams:
             team = Team(**team_data)
@@ -89,12 +79,6 @@ def save_matches(matches: list) -> int:
     """
     Saves a list of clean match dicts to the DB.
     Skips matches with missing team IDs.
-
-    Args:
-        matches: List of clean dicts from clean_matches()
-
-    Returns:
-        Count of matches saved.
     """
     saved = 0
     with get_session() as session:
@@ -109,15 +93,7 @@ def save_matches(matches: list) -> int:
 
 
 def save_players(players: list) -> int:
-    """
-    Saves a list of clean player dicts to the DB.
-
-    Args:
-        players: List of clean dicts from clean_player()
-
-    Returns:
-        Count of players saved.
-    """
+    """Saves a list of clean player dicts to the DB."""
     with get_session() as session:
         for player_data in players:
             if not player_data.get("id"):
@@ -130,14 +106,109 @@ def save_players(players: list) -> int:
 def save_player_stat(stat_data: dict) -> None:
     """
     Saves a single player stat record.
-
-    Args:
-        stat_data: Dict with keys matching PlayerStat model fields.
-                   Must include match_id and player_id.
+    Reserved for future player-level data sources.
+    Currently not called by the pipeline — team-level stats
+    use save_match_stats() instead.
     """
     with get_session() as session:
         stat = PlayerStat(**stat_data)
         session.merge(stat)
+
+
+def save_match_stats(match_id: int, match: dict, stats: dict) -> int:
+    """
+    Saves team-level match statistics from SofaScore to the match_stats table.
+    Stores two rows per match — one for home team, one for away team.
+
+    WHY DELETE-THEN-INSERT:
+        MatchStat rows don't have a single natural business key we can
+        use with merge(). We could use (match_id, team_id) as a composite
+        key, but delete-then-insert is simpler and equally idempotent —
+        re-running the pipeline for the same match overwrites the stats
+        cleanly. This is the same pattern used for match_events.
+
+    Args:
+        match_id:  The DB match ID these stats belong to.
+        match:     Match dict with home_team_id and away_team_id.
+                   Shape: { "home_team_id": int, "away_team_id": int }
+        stats:     Output of clean_sofascore_stats() from cleaner.py.
+                   Shape: { "home": {...}, "away": {...} }
+
+    Returns:
+        Number of rows saved (always 2 if successful, 0 if no stats).
+    """
+    if not stats or not stats.get("home") or not stats.get("away"):
+        return 0
+
+    home_team_id = match.get("home_team_id")
+    away_team_id = match.get("away_team_id")
+
+    if not home_team_id or not away_team_id:
+        return 0
+
+    def _build_stat_row(side_stats: dict, team_id: int, is_home: bool) -> MatchStat:
+        """
+        Constructs a MatchStat ORM object from a side's stats dict.
+        The keys in side_stats map directly to MatchStat column names —
+        this is intentional design: cleaner.py output keys match schema
+        column names so no remapping is needed here.
+        """
+        return MatchStat(
+            match_id=match_id,
+            team_id=team_id,
+            is_home=is_home,
+            possession=side_stats.get("possession"),
+            xg=side_stats.get("xg"),
+            big_chances=side_stats.get("big_chances"),
+            total_shots=side_stats.get("total_shots"),
+            shots_on_target=side_stats.get("shots_on_target"),
+            shots_off_target=side_stats.get("shots_off_target"),
+            shots_inside_box=side_stats.get("shots_inside_box"),
+            passes=side_stats.get("passes"),
+            accurate_passes=side_stats.get("accurate_passes"),
+            pass_accuracy=_compute_pass_accuracy(
+                side_stats.get("accurate_passes"),
+                side_stats.get("passes")
+            ),
+            tackles=side_stats.get("tackles"),
+            interceptions=side_stats.get("interceptions"),
+            recoveries=side_stats.get("recoveries"),
+            clearances=side_stats.get("clearances"),
+            fouls=side_stats.get("fouls"),
+            final_third_entries=side_stats.get("final_third_entries"),
+            long_balls=str(side_stats.get("long_balls", "")) or None,
+            crosses=str(side_stats.get("crosses", "")) or None,
+            goalkeeper_saves=side_stats.get("goalkeeper_saves"),
+            goals_prevented=side_stats.get("goals_prevented"),
+        )
+
+    with get_session() as session:
+        # Delete existing stats for this match before re-inserting
+        session.query(MatchStat).filter_by(match_id=match_id).delete()
+
+        home_row = _build_stat_row(stats["home"], home_team_id, is_home=True)
+        away_row = _build_stat_row(stats["away"], away_team_id, is_home=False)
+
+        session.add(home_row)
+        session.add(away_row)
+
+    return 2
+
+
+def _compute_pass_accuracy(accurate: int | None, total: int | None) -> float | None:
+    """
+    Computes pass accuracy percentage from accurate and total passes.
+
+    WHY COMPUTE HERE INSTEAD OF STORING THE CLEANER VALUE:
+        SofaScore returns pass accuracy as a display string in some
+        responses (e.g. "89%"). Computing it ourselves from the raw
+        counts (accurate_passes / passes * 100) is more reliable and
+        gives us a clean float rather than a string to parse.
+        If either value is missing, returns None — no fake zeros.
+    """
+    if accurate is None or total is None or total == 0:
+        return None
+    return round((accurate / total) * 100, 1)
 
 
 def save_match_events(match_id: int, incidents: dict) -> int:
@@ -145,25 +216,21 @@ def save_match_events(match_id: int, incidents: dict) -> int:
     Saves parsed match events (goals, cards, substitutions) to the DB.
 
     Strategy: delete all existing events for this match first, then
-    re-insert. This is simpler than upserting individual events since
-    MatchEvent rows don't have a natural business key — two players
-    can score in the same minute, so (match_id, minute, type) is not
-    unique enough. Delete-then-insert guarantees idempotency.
+    re-insert. Idempotent — safe to re-run the pipeline.
 
-    Args:
-        match_id: The DB match ID these events belong to.
-        incidents: Output of clean_match_incidents() from cleaner.py.
-            Expected keys: goals, cards, substitutions.
-
-    Returns:
-        Total count of events saved.
+    NOTE on is_home bug:
+        clean_match_incidents() stores team name (string) not is_home
+        (bool) in each incident. We can't reliably derive is_home from
+        team name in this function without passing in home_team_name.
+        This is a known minor issue — is_home in match_events is not
+        used anywhere in the API or frontend currently.
+        Fix when the API needs it: pass home_team_name parameter and
+        compare incident["team"] == home_team_name.
     """
     if not incidents:
         return 0
 
     with get_session() as session:
-        # Delete existing events for this match to avoid duplicates
-        # on repeated pipeline runs
         session.query(MatchEvent).filter_by(match_id=match_id).delete()
 
         saved = 0
@@ -173,17 +240,12 @@ def save_match_events(match_id: int, incidents: dict) -> int:
                 match_id=match_id,
                 event_type="goal",
                 minute=goal["minute"],
-                is_home=goal["team"] != goal["team"],  # resolved below
+                is_home=False,  # placeholder — see NOTE above
                 player_name=goal["scorer"],
                 secondary_player_name=goal.get("assist"),
                 detail=goal.get("type", "regular"),
                 reason=None,
             )
-            # is_home can't be derived from team name alone in this context
-            # since we only have the team name string here, not a boolean.
-            # We re-derive it by checking if goals list came from the home side.
-            # The cleanest fix: store is_home directly in the goals/cards dicts.
-            # For now we set it via the detail field workaround — see NOTE below.
             session.add(event)
             saved += 1
 
@@ -192,7 +254,7 @@ def save_match_events(match_id: int, incidents: dict) -> int:
                 match_id=match_id,
                 event_type="card",
                 minute=card["minute"],
-                is_home=False,  # placeholder — see NOTE
+                is_home=False,  # placeholder
                 player_name=card["player"],
                 secondary_player_name=None,
                 detail=card["card_type"],
@@ -206,7 +268,7 @@ def save_match_events(match_id: int, incidents: dict) -> int:
                 match_id=match_id,
                 event_type="substitution",
                 minute=sub["minute"],
-                is_home=False,  # placeholder — see NOTE
+                is_home=False,  # placeholder
                 player_name=sub["player_off"],
                 secondary_player_name=sub["player_on"],
                 detail="injury" if sub.get("injury") else "tactical",
@@ -217,25 +279,12 @@ def save_match_events(match_id: int, incidents: dict) -> int:
 
     return saved
 
-    # NOTE on is_home:
-    # clean_match_incidents() currently stores team name (string) rather
-    # than is_home (bool) in goals/cards/subs dicts — because team name
-    # is more useful for the AI prompt. To properly populate is_home in
-    # the DB we need to pass home_team_name into save_match_events and
-    # compare. This is a known minor issue — is_home in match_events is
-    # not used anywhere yet. Will fix when the Flask API needs it.
-
 
 def save_summary(match_id: int, content: str) -> None:
     """
     Saves or updates the AI-generated summary for a match.
-    Explicitly checks for an existing summary and updates it
-    rather than inserting — avoids UNIQUE constraint errors
-    on repeated pipeline runs for the same match.
-
-    Args:
-        match_id: The DB match ID this summary belongs to.
-        content: The full text of the AI-generated summary.
+    Checks for an existing summary and updates it rather than
+    inserting — avoids UNIQUE constraint errors on re-runs.
     """
     with get_session() as session:
         existing = session.query(Summary).filter_by(match_id=match_id).first()
@@ -248,7 +297,7 @@ def save_summary(match_id: int, content: str) -> None:
 
 def get_match_ids_in_db() -> list:
     """
-    Returns a list of all match IDs currently stored in the DB.
+    Returns all match IDs currently stored in the DB.
     Used by the pipeline to skip already-stored matches.
     """
     with get_session() as session:

@@ -11,7 +11,7 @@ Orchestrates the full pipeline for any supported competition:
        a. Fetch SofaScore stats and lineups
        b. Fetch SofaScore incidents (goals, cards, subs)
        c. Generate AI summary via Groq
-       d. Save summary and events to DB
+       d. Save summary, events, and match stats to DB   ← updated
     6. Sleep 3s between matches to respect Groq rate limits
 
 CLI USAGE:
@@ -36,14 +36,6 @@ SUPPORTED COMPETITION CODES (football-data.org free tier):
     BL1  Bundesliga
     SA   Serie A
     FL1  Ligue 1
-
-WHY A LOOKUP TABLE FOR COMPETITION METADATA:
-    The Football-Data.org API uses numeric IDs internally (PL=2021,
-    CL=2001 etc.) but exposes competition codes as strings in URLs.
-    We need both — the code for the API request URL, the numeric ID
-    for our DB foreign key, and the name string for the AI prompt.
-    Storing all three in one dict avoids passing three separate args
-    everywhere and makes adding new competitions a one-line change.
 """
 
 import sys
@@ -57,6 +49,7 @@ from backend.db.writer import (
     save_teams,
     save_matches,
     save_match_events,
+    save_match_stats,
     save_summary,
     get_match_ids_in_db,
 )
@@ -84,11 +77,6 @@ SessionLocal = sessionmaker(bind=engine)
 # Competition registry
 # -------------------------------------------------------------------------
 
-# All competitions supported by football-data.org free tier that we cover.
-# Each entry: code -> { id, name }
-#   code: the string used in API URLs and CLI --competition flag
-#   id:   numeric ID used in our DB and some API endpoints
-#   name: human-readable name passed to the AI summarizer prompt
 COMPETITIONS = {
     "PL":  {"id": 2021, "name": "Premier League"},
     "CL":  {"id": 2001, "name": "UEFA Champions League"},
@@ -98,11 +86,10 @@ COMPETITIONS = {
     "FL1": {"id": 2015, "name": "Ligue 1"},
 }
 
-# Default competition when none specified
 DEFAULT_COMPETITION = "PL"
 
 # Seconds to wait between Groq API calls.
-# Groq free tier: 30 requests/minute, 6000 tokens/minute on llama-3.3-70b.
+# Groq free tier: 30 req/min, 6000 tokens/min on llama-3.3-70b.
 # Each summary ~2300 tokens. 3s gap keeps us safely within limits.
 GROQ_DELAY_SECONDS = 3
 
@@ -165,17 +152,12 @@ def step_get_unanalysed_matches(raw_matches: list,
     Step 3: Find finished matches that need summarizing.
 
     AUTO MODE (target_matchday=None):
-        Counts finished matches per matchday, picks the most complete.
-        Handles out-of-order fixtures — one lone MD31 match won't
-        beat a nearly-complete MD29 with 9 finished.
+        Picks the most complete matchday by finished match count.
 
     BACKFILL MODE (target_matchday=N):
-        Directly targets matchday N. For catching up on historical rounds.
+        Directly targets matchday N.
 
-    Both modes skip matches that already have summaries — idempotent.
-
-    Returns:
-        List of raw match dicts sorted chronologically by kick-off time.
+    Both modes skip matches that already have summaries.
     """
     finished = [m for m in raw_matches if m.get("status") == "FINISHED"]
 
@@ -184,7 +166,6 @@ def step_get_unanalysed_matches(raw_matches: list,
         return []
 
     if target_matchday is not None:
-        # --- BACKFILL MODE ---
         print(f"[3/5] Backfill mode — targeting MD{target_matchday}...")
         matchday_matches = [
             m for m in finished if m.get("matchday") == target_matchday
@@ -198,14 +179,12 @@ def step_get_unanalysed_matches(raw_matches: list,
         print(f"      MD{target_matchday}: {len(matchday_matches)}/{total_in_md} finished")
 
     else:
-        # --- AUTO MODE ---
         print("[3/5] Finding unanalysed matches from most complete matchday...")
         matchday_counts = {}
         for m in finished:
             md = m.get("matchday", 0)
             matchday_counts[md] = matchday_counts.get(md, 0) + 1
 
-        # Most finished matches wins. Tiebreak: higher matchday = more recent.
         chosen_md = max(
             matchday_counts,
             key=lambda md: (matchday_counts[md], md)
@@ -220,7 +199,6 @@ def step_get_unanalysed_matches(raw_matches: list,
             m for m in finished if m.get("matchday") == chosen_md
         ]
 
-    # Skip matches that already have summaries
     session = SessionLocal()
     try:
         existing_summary_ids = {
@@ -333,12 +311,37 @@ def step_summarize(raw_match: dict, competition_name: str,
     return summarize_match(context)
 
 
-def step_save(match_id: int, summary: str, incidents: dict):
-    """Persist AI summary and match events to DB."""
+def step_save(match_id: int, summary: str, incidents: dict,
+              raw_match: dict, sofascore_data: dict):
+    """
+    Persist AI summary, match events, and team-level stats to DB.
+
+    WHY sofascore_data IS NOW PASSED HERE:
+        Previously step_save only received match_id, summary, incidents.
+        To save match_stats we need the cleaned stats dict from SofaScore
+        and the home/away team IDs from the raw match. Both are now passed
+        in so save_match_stats() has everything it needs.
+
+        This is a deliberate change to the function signature — any caller
+        must now pass raw_match and sofascore_data. The pipeline loop
+        already has both, so no structural change is needed there.
+    """
     save_summary(match_id, summary)
+
     if incidents:
         saved_events = save_match_events(match_id, incidents)
         print(f"      Saved {saved_events} event(s) to DB.")
+
+    # Save team-level stats if SofaScore data was available for this match
+    if sofascore_data and sofascore_data.get("stats"):
+        cleaned_stats = sofascore_data["stats"]
+        match_team_ids = {
+            "home_team_id": raw_match.get("homeTeam", {}).get("id"),
+            "away_team_id": raw_match.get("awayTeam", {}).get("id"),
+        }
+        saved_stats = save_match_stats(match_id, match_team_ids, cleaned_stats)
+        if saved_stats:
+            print(f"      Saved match stats (home + away) to DB.")
 
 
 # -------------------------------------------------------------------------
@@ -354,15 +357,8 @@ def run_pipeline(
     """
     Runs the full ETL + summarization pipeline for a competition.
 
-    If competition_id or competition_name are None, they are looked up
-    from the COMPETITIONS registry using competition_code. This means
-    callers only need to pass competition_code — the rest is automatic.
-
-    The frontend POST /api/pipeline/run calls this with no arguments,
-    which defaults to Premier League auto mode — unchanged behaviour.
-
     Args:
-        competition_code:  e.g. "PL", "CL", "PD" — see COMPETITIONS dict
+        competition_code:  e.g. "PL", "CL", "PD"
         competition_id:    numeric DB id — looked up if None
         competition_name:  human name for AI prompt — looked up if None
         target_matchday:   specific matchday to process, or None for auto
@@ -370,7 +366,6 @@ def run_pipeline(
     Returns:
         List of result dicts — one per match attempted.
     """
-    # Look up competition metadata if not provided directly
     if competition_code not in COMPETITIONS:
         raise ValueError(
             f"Unknown competition code: {competition_code}. "
@@ -424,8 +419,9 @@ def run_pipeline(
             summary = step_summarize(
                 raw_match, competition_name, sofascore_data, incidents
             )
-            step_save(match_id, summary, incidents)
-            print(f"      ✓ Done.\n")
+            # Pass raw_match and sofascore_data so step_save can persist stats
+            step_save(match_id, summary, incidents, raw_match, sofascore_data)
+            print(f"      ✔ Done.\n")
             results.append({
                 "match_id": match_id,
                 "home_team": home,
