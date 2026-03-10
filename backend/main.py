@@ -14,55 +14,40 @@ Orchestrates the full pipeline for any supported competition:
        d. Save summary, events, and match stats to DB
     6. Sleep 3s between matches to respect Groq rate limits
 
-PROGRESS CALLBACK (added this session):
+--force FLAG:
+    Normally the pipeline skips matches that already have summaries.
+    --force deletes existing summaries for the target matchday before
+    running, so they get regenerated from scratch.
 
-    run_pipeline() now accepts an optional progress_callback parameter.
-    This is a function that the pipeline calls at key moments to report
-    what it's doing. The callback signature is:
+    RULES:
+      - --force REQUIRES --matchday. Without it the pipeline exits with
+        an error. This prevents accidentally wiping auto-detected matchdays.
+      - Only the summaries table rows for the specific competition +
+        matchday are deleted. match_events and match_stats are kept —
+        the pipeline overwrites them anyway via delete-then-insert.
+      - Normal runs (no --force) are completely unaffected.
 
-        progress_callback(event: str, data: dict)
+    USE CASE:
+      Regenerating summaries that contain "Unknown player" text, generated
+      before the cleaner.py Unknown filter was added in Session 15.
 
-    Events fired:
-        "total_found"  — how many unanalysed matches were found
-        "match_start"  — about to start processing a specific match
-        "match_done"   — a match finished (ok or error)
-        "up_to_date"   — no unanalysed matches found
-        "complete"     — all matches processed
+    EXAMPLE:
+      python -m backend.main --competition PD --matchday 26 --force
+      python -m backend.main --competition PL --matchday 29 --force
 
-    WHY A CALLBACK AND NOT A DIRECT IMPORT:
-        main.py should not know anything about Flask or HTTP.
-        Injecting a callback keeps main.py reusable — it can be called
-        from the CLI (no callback), from routes.py (with callback),
-        or from tests (with a mock callback). This is called
-        "dependency injection" — behaviour is passed in, not hardcoded.
-
-    WHY NOT JUST WRITE TO _pipeline_progress DIRECTLY:
-        main.py would then depend on routes.py, creating a circular import.
-        routes.py imports from main.py — if main.py imported back from
-        routes.py, Python would fail with an ImportError at startup.
+PROGRESS CALLBACK:
+    run_pipeline() accepts an optional progress_callback parameter.
+    Called by routes.py to report live progress to the frontend.
+    CLI runs pass no callback — all callback calls are no-ops.
 
 CLI USAGE:
+    python -m backend.main
+    python -m backend.main --competition CL
+    python -m backend.main --competition PD --matchday 26
+    python -m backend.main --competition PD --matchday 26 --force
 
-    Default — Premier League, auto matchday detection:
-        python -m backend.main
-
-    Specific competition:
-        python -m backend.main --competition CL
-        python -m backend.main --competition PD
-        python -m backend.main --competition BL1
-        python -m backend.main --competition SA
-
-    Specific competition + specific matchday (backfill):
-        python -m backend.main --competition CL --matchday 6
-        python -m backend.main --competition PD --matchday 25
-
-SUPPORTED COMPETITION CODES (football-data.org free tier):
-    PL   Premier League
-    CL   UEFA Champions League
-    PD   La Liga (Primera Division)
-    BL1  Bundesliga
-    SA   Serie A
-    FL1  Ligue 1
+SUPPORTED COMPETITION CODES:
+    PL, CL, PD, BL1, SA, FL1
 """
 
 import sys
@@ -71,7 +56,7 @@ import argparse
 from datetime import datetime
 from typing import Callable, Optional
 
-from backend.db.schema import init_db, Summary
+from backend.db.schema import init_db, Summary, Match, Competition
 from backend.db.writer import (
     save_competitions,
     save_teams,
@@ -115,8 +100,64 @@ COMPETITIONS = {
 }
 
 DEFAULT_COMPETITION = "PL"
-
 GROQ_DELAY_SECONDS = 3
+
+
+# -------------------------------------------------------------------------
+# Force regenerate helper
+# -------------------------------------------------------------------------
+
+def force_delete_summaries(competition_code: str,
+                           target_matchday: int) -> int:
+    """
+    Deletes all summaries for a specific competition + matchday.
+    Called when --force flag is used, before the pipeline runs.
+
+    WHY DELETE ONLY SUMMARIES AND NOT EVENTS/STATS:
+        The pipeline's "already analysed" check only queries the summaries
+        table. Deleting the summary row is enough to make the pipeline
+        treat the match as unanalysed. match_events and match_stats use
+        a delete-then-insert pattern in writer.py — they get overwritten
+        automatically when the pipeline runs. Deleting them here first
+        would be redundant.
+
+    Returns:
+        Number of summary rows deleted.
+    """
+    session = SessionLocal()
+    try:
+        # Step 1 — find all match IDs for this competition + matchday
+        match_ids = [
+            row.id
+            for row in session.query(Match)
+            .join(Competition, Match.competition_id == Competition.id)
+            .filter(
+                Competition.code == competition_code,
+                Match.matchday == target_matchday,
+            )
+            .all()
+        ]
+
+        if not match_ids:
+            print(f"      No matches found for {competition_code} MD{target_matchday}.")
+            return 0
+
+        # Step 2 — delete summaries for those match IDs
+        # synchronize_session=False: skip SQLAlchemy's in-memory sync —
+        # faster for bulk deletes where we don't need the objects afterward
+        deleted = (
+            session.query(Summary)
+            .filter(Summary.match_id.in_(match_ids))
+            .delete(synchronize_session=False)
+        )
+        session.commit()
+        return deleted
+
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
 
 
 # -------------------------------------------------------------------------
@@ -124,7 +165,6 @@ GROQ_DELAY_SECONDS = 3
 # -------------------------------------------------------------------------
 
 def step_init():
-    """Step 1: Ensure DB exists with all tables."""
     print("[1/5] Initializing database...")
     init_db()
     print("      Done.\n")
@@ -132,10 +172,6 @@ def step_init():
 
 def step_fetch_and_store(competition_code: str,
                          competition_id: int) -> list:
-    """
-    Step 2: Fetch all matches for a competition from Football-Data.org.
-    Saves new competitions, teams, and matches to DB.
-    """
     print(f"[2/5] Fetching matches for: {competition_code}...")
 
     raw_matches = get_matches_by_competition(competition_code)
@@ -169,7 +205,6 @@ def step_fetch_and_store(competition_code: str,
 
 def step_get_unanalysed_matches(raw_matches: list,
                                 target_matchday: int | None = None) -> list:
-    """Step 3: Find finished matches that need summarizing."""
     finished = [m for m in raw_matches if m.get("status") == "FINISHED"]
 
     if not finished:
@@ -233,7 +268,6 @@ def step_get_unanalysed_matches(raw_matches: list,
 
 
 def step_fetch_sofascore_data(raw_match: dict) -> dict:
-    """Fetch SofaScore statistics and lineups for a single match."""
     from backend.scrapers.sofascore import get_full_match_data
 
     home_team = raw_match.get("homeTeam", {}).get("name", "")
@@ -270,7 +304,6 @@ def step_fetch_sofascore_data(raw_match: dict) -> dict:
 
 def step_fetch_incidents(sofascore_data: dict, home_team: str,
                          away_team: str) -> dict:
-    """Clean match incidents (goals, cards, subs) from SofaScore data."""
     raw_incidents = sofascore_data.get("raw_incidents", {})
     if not raw_incidents:
         return {}
@@ -289,7 +322,6 @@ def step_fetch_incidents(sofascore_data: dict, home_team: str,
 
 def step_summarize(raw_match: dict, competition_name: str,
                    sofascore_data: dict, incidents: dict) -> str:
-    """Build match context and generate AI summary via Groq."""
     match_data = {
         "home_team": raw_match.get("homeTeam", {}).get("name", "Unknown"),
         "away_team": raw_match.get("awayTeam", {}).get("name", "Unknown"),
@@ -324,7 +356,6 @@ def step_summarize(raw_match: dict, competition_name: str,
 
 def step_save(match_id: int, summary: str, incidents: dict,
               raw_match: dict, sofascore_data: dict):
-    """Persist AI summary, match events, and team-level stats to DB."""
     save_summary(match_id, summary)
 
     if incidents:
@@ -351,6 +382,7 @@ def run_pipeline(
     competition_id: int = None,
     competition_name: str = None,
     target_matchday: int | None = None,
+    force: bool = False,
     progress_callback: Optional[Callable] = None,
 ) -> list:
     """
@@ -361,24 +393,27 @@ def run_pipeline(
         competition_id:     numeric DB id — looked up if None
         competition_name:   human name for AI prompt — looked up if None
         target_matchday:    specific matchday to process, or None for auto
-        progress_callback:  optional fn(event, data) for live progress reporting
-                            Pass None when running from CLI — no-op.
-
-    Returns:
-        List of result dicts — one per match attempted.
+        force:              delete existing summaries before running
+                            REQUIRES target_matchday — errors if None
+        progress_callback:  optional fn(event, data) for live progress
     """
-    # Helper: fire callback safely — if no callback is set, do nothing.
-    # Using a helper means every call site is clean: _cb("event", {...})
-    # instead of: if progress_callback: progress_callback("event", {...})
     def _cb(event: str, data: dict):
         if progress_callback:
             progress_callback(event, data)
+
+    # Guard: --force without --matchday is dangerous — reject it
+    if force and target_matchday is None:
+        raise ValueError(
+            "--force requires --matchday. "
+            "Specify which matchday to regenerate, e.g. --matchday 26 --force"
+        )
 
     if competition_code not in COMPETITIONS:
         raise ValueError(
             f"Unknown competition code: {competition_code}. "
             f"Supported: {', '.join(COMPETITIONS.keys())}"
         )
+
     comp_meta = COMPETITIONS[competition_code]
     if competition_id is None:
         competition_id = comp_meta["id"]
@@ -387,6 +422,9 @@ def run_pipeline(
 
     start = datetime.now()
     mode = f"BACKFILL MD{target_matchday}" if target_matchday else "AUTO"
+    if force:
+        mode += " (FORCE REGENERATE)"
+
     print("=" * 55)
     print(f"  FOOTBALL ANALYTICS PIPELINE — V2")
     print(f"  Competition: {competition_name} ({competition_code})")
@@ -395,6 +433,14 @@ def run_pipeline(
     print("=" * 55 + "\n")
 
     step_init()
+
+    # --force: wipe existing summaries so pipeline treats them as new
+    if force:
+        print(f"[FORCE] Deleting existing summaries for "
+              f"{competition_code} MD{target_matchday}...")
+        deleted = force_delete_summaries(competition_code, target_matchday)
+        print(f"[FORCE] Deleted {deleted} summary/summaries. "
+              f"Will regenerate from scratch.\n")
 
     raw_matches = step_fetch_and_store(competition_code, competition_id)
     if not raw_matches:
@@ -407,15 +453,12 @@ def run_pipeline(
         md_label = f"MD{target_matchday}" if target_matchday else "the most complete matchday"
         print(f"All matches from {md_label} are already analysed.")
         print("Nothing to do.\n")
-        # Fire up_to_date — frontend will show "seems up-to-date"
         _cb("up_to_date", {})
         _cb("complete", {})
         return []
 
     total = len(unanalysed)
     print(f"[4/5] Processing {total} match(es)...\n")
-
-    # Tell the frontend how many matches we found
     _cb("total_found", {"total": total})
 
     results = []
@@ -426,14 +469,7 @@ def run_pipeline(
         match_id = raw_match.get("id")
 
         print(f"  [{i}/{total}] {home} vs {away} (ID: {match_id})")
-
-        # Tell the frontend which match is starting and what index it is
-        _cb("match_start", {
-            "index": i,
-            "total": total,
-            "home":  home,
-            "away":  away,
-        })
+        _cb("match_start", {"index": i, "total": total, "home": home, "away": away})
 
         try:
             sofascore_data = step_fetch_sofascore_data(raw_match)
@@ -444,7 +480,6 @@ def run_pipeline(
             )
             step_save(match_id, summary, incidents, raw_match, sofascore_data)
             print(f"      ✓ Done.\n")
-
             _cb("match_done", {"status": "ok", "home": home, "away": away})
             results.append({
                 "match_id": match_id,
@@ -494,13 +529,14 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m backend.main                          # PL, auto matchday
-  python -m backend.main --competition CL         # Champions League, auto
-  python -m backend.main --competition PD         # La Liga, auto
-  python -m backend.main --competition BL1        # Bundesliga, auto
-  python -m backend.main --competition SA         # Serie A, auto
-  python -m backend.main --competition CL --matchday 6   # CL backfill MD6
-  python -m backend.main --matchday 24            # PL backfill MD24
+  python -m backend.main                                        # PL, auto
+  python -m backend.main --competition CL                       # CL, auto
+  python -m backend.main --competition PD --matchday 26         # La Liga MD26
+  python -m backend.main --competition PD --matchday 26 --force # regenerate
+
+--force requires --matchday. Deletes existing summaries for that matchday
+and regenerates from scratch. Use to fix summaries generated before a
+prompt fix (e.g. Unknown player filter added in Session 15).
 
 Supported competition codes: PL, CL, PD, BL1, SA, FL1
         """
@@ -516,12 +552,18 @@ Supported competition codes: PL, CL, PD, BL1, SA, FL1
         "--matchday",
         type=int,
         default=None,
-        help="Specific matchday to process (default: auto-detect most complete)"
+        help="Specific matchday to process (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Delete existing summaries and regenerate. Requires --matchday."
     )
     args = parser.parse_args()
 
-    # CLI runs without a callback — progress_callback defaults to None
     run_pipeline(
         competition_code=args.competition,
         target_matchday=args.matchday,
+        force=args.force,
     )
