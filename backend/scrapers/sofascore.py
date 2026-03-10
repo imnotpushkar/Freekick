@@ -260,9 +260,13 @@ def find_sofascore_match_id(matches: list, home_team: str,
     """
     def _normalize(name: str) -> str:
         name = name.lower()
-        for suffix in [" fc", " united", " city", " wanderers",
-                       " rovers", " athletic", " albion", " hotspur"]:
-            name = name.replace(suffix, "")
+        for prefix in ["rc ", "rcd ", "club ", "cf "]:
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+        for token in [" fc", " united", " city", " wanderers", " rovers",
+                      " athletic", " albion", " hotspur"]:
+            name = name.replace(token, "")
+        name = name.replace(" de ", " ")
         return name.strip()
 
     home_norm = _normalize(home_team)
@@ -277,6 +281,7 @@ def find_sofascore_match_id(matches: list, home_team: str,
             return match.get("id")
 
     return None
+
 
 
 def get_full_match_data(date_str: str, home_team: str,
