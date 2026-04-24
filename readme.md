@@ -42,3 +42,11 @@ n8n/            # Automation workflow exports
 data/           # Raw and processed data (gitignored)
 tests/          # Unit tests
 ```
+
+
+##Run Frontend Server
+  cd frontend
+  npm run dev
+
+##Run Backend Server
+  python -m backend.api.app
