@@ -1,8 +1,10 @@
-# Football Analytics System
+# ⚽ Football Analytics System
 
-A modular football analytics pipeline that collects match data, processes player stats, and generates AI-powered performance summaries.
+A modular football analytics platform that collects match data, processes player statistics, and generates AI-powered performance insights.
 
-## Contributors
+---
+
+## 👥 Contributors
 
 | Name | Role |
 |------|------|
@@ -12,39 +14,52 @@ A modular football analytics pipeline that collects match data, processes player
 
 ---
 
-## Versions
+## 🚀 Project Roadmap
 
 | Version | Name | Status |
 |---------|------|--------|
-| V1 | Player Performance Tracker | ✅ Current |
-| V2 | Match Momentum Dashboard | Upcoming |
-| V3 | Tactical Comparisons | Upcoming |
-| V4 | Fan Sentiment Analyzer | Upcoming |
-| V5 | Predictive Analytics | Upcoming |
+| **V1** | Player Performance Tracker | ✅ Current |
+| **V2** | Match Momentum Dashboard | Upcoming |
+| **V3** | Tactical Comparisons | Upcoming |
+| **V4** | Fan Sentiment Analyzer | Upcoming |
+| **V5** | Predictive Analytics | Upcoming |
 
 ---
 
-## Project Structure
+## 🛠️ Tech Stack
 
-```
-backend/        # Python pipeline (scrapers, processors, API, summarizer)
-frontend/       # React dashboard (V2+)
-n8n/            # Automation workflow exports
-data/           # Raw and processed data (gitignored)
-tests/          # Unit tests
+- **Backend:** Python (Flask-based API & data pipeline)  
+- **Frontend:** React (Vite)  
+- **Automation:** n8n  
+- **Data Processing:** Custom scripts  
+
+---
+
+## 📦 Project Structure
+
+```text
+football-analytics/
+│
+├── backend/        # Python pipeline (scrapers, processors, API, summarizer)
+├── frontend/       # React dashboard (V2+)
+├── n8n/            # Automation workflow exports
+├── data/           # Raw & processed data (gitignored)
+├── tests/          # Unit tests
+└── README.md
 ```
 
 ---
 
-## Setup
+## ⚙️ Setup Instructions
 
-### Prerequisites
-
+### 🔧 Prerequisites
 - Python 3.11+
 - Node.js & npm
 - Git
 
-### Installation
+---
+
+### 📥 Installation
 
 ```bash
 # Clone the repository
@@ -60,37 +75,63 @@ venv\Scripts\activate
 # Mac/Linux
 source venv/bin/activate
 
-# Install Python dependencies
+# Install backend dependencies
 pip install -r requirements.txt
-
-# Set up environment variables
-cp .env.example .env
-# Edit .env and add your API keys
 ```
 
 ---
 
-## Running the Application
+### 🔐 Environment Variables
 
-### Backend
+```bash
+# Copy example file
+cp .env.example .env
+```
+
+Edit the `.env` file and add the required keys (refer to `.env.example` for the full list):
+* `FOOTBALL_DATA_API_KEY`
+* `GROQ_API_KEY`
+* `RAPID_API_KEY`
+
+---
+
+## ▶️ Running the Application
+
+### 🧠 Start Backend Server
 
 Start the Python API server from the project root:
 
 ```bash
+# Ensure virtual environment is activated
 python -m backend.api.app
 ```
 
-### Frontend
+---
+
+### 🎨 Start Frontend Server
 
 Navigate to the frontend directory and start the dev server:
 
 ```bash
 cd frontend
+npm install
 npm run dev
 ```
 
 ---
 
-## Environment Variables
+## 📌 Notes
 
-Copy `.env.example` to `.env` and fill in the required keys before running either service. Refer to `.env.example` for the full list of required variables.
+* Start the backend before the frontend
+* Frontend runs on: [http://localhost:5173](http://localhost:5173)
+* Backend port depends on your Flask configuration
+
+---
+
+## 🌱 Future Scope
+
+This project is designed to evolve into a full-fledged football intelligence suite with:
+
+* Advanced analytics
+* Real-time match tracking
+* AI-driven predictions
