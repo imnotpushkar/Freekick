@@ -45,7 +45,7 @@ tests/          # Unit tests
 
 
 ##Run Frontend Server
-  cd frontend
+  \ncd frontend
   npm run dev
 
 ##Run Backend Server
